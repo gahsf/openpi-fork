@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from typing_extensions import override
 
 from openpi.models import model as _model
+from openpi.models import overview_action_conditioning as _overview_action_conditioning
 import openpi.models.gemma as _gemma
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
@@ -20,6 +21,9 @@ class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     paligemma_variant: _gemma.Variant = "gemma_2b"
     action_expert_variant: _gemma.Variant = "gemma_300m"
+    overview_action_conditioning: _overview_action_conditioning.OverviewActionConditioningConfig = dataclasses.field(
+        default_factory=_overview_action_conditioning.OverviewActionConditioningConfig
+    )
 
     # Set the model specific defaults.
     action_dim: int = 32
@@ -35,6 +39,11 @@ class Pi0Config(_model.BaseModelConfig):
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
+        if self.overview_action_conditioning.enabled:
+            if self.pi05:
+                raise ValueError("Overview action conditioning V1 does not support pi05")
+            if "lora" in self.paligemma_variant or "lora" in self.action_expert_variant:
+                raise ValueError("Overview action conditioning V1 does not support existing LoRA variants")
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
