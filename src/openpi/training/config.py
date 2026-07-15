@@ -963,6 +963,41 @@ _CONFIGS = [
         wandb_enabled=False,
     ),
     TrainConfig(
+        name="pi0_ocaev1_smoke",
+        data=FakeDataConfig(),
+        batch_size=1,
+        model=pi0_config.Pi0Config(
+            overview_action_conditioning=overview_action_conditioning.OverviewActionConditioningConfig(
+                enabled=True,
+                rank=16,
+                lora_alpha=16.0,
+                target="q_o",
+            )
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            overview_action_conditioning=overview_action_conditioning.OverviewActionConditioningConfig(
+                enabled=True,
+                rank=16,
+                lora_alpha=16.0,
+                target="q_o",
+            )
+        ).get_freeze_filter(),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5,
+            peak_lr=1e-5,
+            decay_steps=50,
+            decay_lr=1e-6,
+        ),
+        ema_decay=None,
+        log_interval=1,
+        save_interval=50,
+        overwrite=True,
+        exp_name="smoke",
+        num_train_steps=50,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
         name="debug",
         data=FakeDataConfig(),
         batch_size=2,

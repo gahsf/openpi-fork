@@ -13,6 +13,7 @@ from openpi.models import pi0_fast
 from openpi.shared import download
 from openpi.shared import nnx_utils
 from openpi.training import config as training_config
+from openpi.training import optimizer as training_optimizer
 from openpi.training import weight_loaders
 
 
@@ -88,6 +89,29 @@ def test_pi0_ocaev1_training_config():
     assert isinstance(config.weight_loader, weight_loaders.CheckpointWeightLoader)
     assert config.weight_loader.params_path == "gs://openpi-assets/checkpoints/pi0_base/params"
     assert config.batch_size == 1
+    assert config.ema_decay is None
+
+
+def test_pi0_ocaev1_smoke_training_config():
+    config = training_config.get_config("pi0_ocaev1_smoke")
+
+    assert isinstance(config.model, pi0_config.Pi0Config)
+    assert config.model.overview_action_conditioning == overview_action_conditioning.OverviewActionConditioningConfig(
+        enabled=True,
+        rank=16,
+        lora_alpha=16.0,
+        target="q_o",
+    )
+    assert config.freeze_filter == config.model.get_freeze_filter()
+    assert isinstance(config.weight_loader, weight_loaders.CheckpointWeightLoader)
+    assert isinstance(config.lr_schedule, training_optimizer.CosineDecaySchedule)
+    assert config.lr_schedule.warmup_steps == 5
+    assert config.lr_schedule.peak_lr == 1e-5
+    assert config.lr_schedule.decay_steps == 50
+    assert config.lr_schedule.decay_lr == 1e-6
+    assert config.batch_size == 1
+    assert config.num_train_steps == 50
+    assert config.log_interval == 1
     assert config.ema_decay is None
 
 
