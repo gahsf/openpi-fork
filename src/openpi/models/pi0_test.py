@@ -13,6 +13,19 @@ def _get_frozen_state(config: _pi0_config.Pi0Config) -> nnx.State:
     return nnx.state(abstract_model, nnx.All(nnx.Param, freeze_filter)).flat_state()
 
 
+def _ocaev1_config(target):
+    return _pi0_config.Pi0Config(
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        overview_action_conditioning=_overview_action_conditioning.OverviewActionConditioningConfig(
+            enabled=True,
+            rank=2,
+            lora_alpha=2.0,
+            target=target,
+        ),
+    )
+
+
 def test_pi0_full_finetune():
     config = _pi0_config.Pi0Config()
     state = _get_frozen_state(config)
@@ -57,19 +70,49 @@ def test_pi0_all_lora():
     ],
 )
 def test_pi0_ocaev1_parameter_tree(target, expects_q, expects_o):
-    config = _pi0_config.Pi0Config(
-        paligemma_variant="dummy",
-        action_expert_variant="dummy",
-        overview_action_conditioning=_overview_action_conditioning.OverviewActionConditioningConfig(
-            enabled=True,
-            rank=2,
-            lora_alpha=2.0,
-            target=target,
-        ),
-    )
+    config = _ocaev1_config(target)
     abstract_model = nnx.eval_shape(config.create, jax.random.key(0))
     paths = ["/".join(str(part) for part in path) for path in nnx.state(abstract_model).flat_state()]
 
     assert any("overview_action_conditioning" in path for path in paths)
     assert any("conditional_q_lora_1" in path for path in paths) is expects_q
     assert any("conditional_o_lora_1" in path for path in paths) is expects_o
+
+
+@pytest.mark.parametrize(
+    ("target", "expects_q", "expects_o"),
+    [
+        ("q", True, False),
+        ("o", False, True),
+        ("q_o", True, True),
+    ],
+)
+def test_pi0_ocaev1_freezes_everything_except_new_params(target, expects_q, expects_o):
+    config = _ocaev1_config(target)
+    abstract_model = nnx.eval_shape(config.create, jax.random.key(0))
+    trainable_state = nnx.state(
+        abstract_model,
+        nnx.All(nnx.Param, nnx.Not(config.get_freeze_filter())),
+    ).flat_state()
+    trainable_paths = ["/".join(str(part) for part in path) for path in trainable_state]
+    frozen_paths = ["/".join(str(part) for part in path) for path in _get_frozen_state(config)]
+
+    assert trainable_paths
+    assert all(
+        "overview_action_conditioning" in path or "conditional_q_lora_1" in path or "conditional_o_lora_1" in path
+        for path in trainable_paths
+    )
+    assert any("overview_action_conditioning" in path for path in trainable_paths)
+    assert any("conditional_q_lora_1" in path for path in trainable_paths) is expects_q
+    assert any("conditional_o_lora_1" in path for path in trainable_paths) is expects_o
+    assert not any("action_out_proj" in path for path in trainable_paths)
+    assert not any("state_proj" in path for path in trainable_paths)
+    assert not any(
+        "overview_action_conditioning" in path or "conditional_q_lora_1" in path or "conditional_o_lora_1" in path
+        for path in frozen_paths
+    )
+    assert any("PaliGemma/img" in path for path in frozen_paths)
+    assert any("PaliGemma/llm/layers/attn/q_einsum_1" in path for path in frozen_paths)
+    assert any("state_proj" in path for path in frozen_paths)
+    assert any("action_in_proj" in path for path in frozen_paths)
+    assert any("action_out_proj" in path for path in frozen_paths)

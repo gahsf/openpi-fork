@@ -96,6 +96,10 @@ class Pi0Config(_model.BaseModelConfig):
 
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
         """Returns the freeze filter based on the model config."""
+        if self.overview_action_conditioning.enabled:
+            trainable_filter = nnx_utils.PathRegex(".*(overview_action_conditioning|conditional_(q|o)_lora_1).*")
+            return nnx.Not(trainable_filter)
+
         filters = []
         has_lora = False
         gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
