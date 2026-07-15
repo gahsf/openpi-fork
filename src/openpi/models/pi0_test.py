@@ -1,6 +1,7 @@
 import flax.nnx as nnx
 import jax
 
+import openpi.models.overview_action_conditioning as _overview_action_conditioning
 import openpi.models.pi0_config as _pi0_config
 
 
@@ -44,3 +45,22 @@ def test_pi0_all_lora():
     assert len(state) == 17
     assert all("lora" not in p for p in state)
     assert all("llm" in p for p in state)
+
+
+def test_pi0_ocaev1_q_parameter_tree():
+    config = _pi0_config.Pi0Config(
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        overview_action_conditioning=_overview_action_conditioning.OverviewActionConditioningConfig(
+            enabled=True,
+            rank=2,
+            lora_alpha=2.0,
+            target="q",
+        ),
+    )
+    abstract_model = nnx.eval_shape(config.create, jax.random.key(0))
+    paths = ["/".join(str(part) for part in path) for path in nnx.state(abstract_model).flat_state()]
+
+    assert any("overview_action_conditioning" in path for path in paths)
+    assert any("conditional_q_lora_1" in path for path in paths)
+    assert not any("conditional_o_lora_1" in path for path in paths)

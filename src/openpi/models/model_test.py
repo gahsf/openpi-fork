@@ -3,6 +3,7 @@ import jax
 import pytest
 
 from openpi.models import model as _model
+from openpi.models import overview_action_conditioning
 from openpi.models import pi0_config
 from openpi.models import pi0_fast
 from openpi.shared import download
@@ -36,6 +37,30 @@ def test_pi0_lora_model():
     assert loss.shape == (batch_size, config.action_horizon)
 
     actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=10)
+    assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
+
+
+def test_pi0_ocaev1_q_model():
+    key = jax.random.key(0)
+    config = pi0_config.Pi0Config(
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        overview_action_conditioning=overview_action_conditioning.OverviewActionConditioningConfig(
+            enabled=True,
+            rank=2,
+            lora_alpha=2.0,
+            target="q",
+        ),
+    )
+    model = config.create(key)
+
+    batch_size = 1
+    obs, act = config.fake_obs(batch_size), config.fake_act(batch_size)
+
+    loss = nnx_utils.module_jit(model.compute_loss)(key, obs, act)
+    assert loss.shape == (batch_size, config.action_horizon)
+
+    actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=2)
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
 
 

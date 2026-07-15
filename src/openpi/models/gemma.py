@@ -34,6 +34,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 
+from openpi.models import overview_action_conditioning as _overview_action_conditioning
 import openpi.models.lora as lora
 import openpi.shared.array_typing as at
 import openpi.training.sharding as sharding
@@ -154,14 +155,41 @@ class Embedder(nn.Module):
         return jnp.dot(x, self.input_embedding_table.T)
 
 
+class ConditionalQueryLoRA(nn.Module):
+    width: int
+    num_heads: int
+    head_dim: int
+    rank: int
+    alpha: float
+
+    @nn.compact
+    def __call__(self, x, gate):
+        dtype = x.dtype
+        lora_a = self.param(
+            "lora_a",
+            nn.initializers.normal(stddev=0.01),
+            (self.num_heads, self.width, self.rank),
+        ).astype(dtype)
+        lora_b = self.param(
+            "lora_b",
+            nn.initializers.normal(stddev=0.01),
+            (self.num_heads, self.rank, self.head_dim),
+        ).astype(dtype)
+        low_rank = jnp.einsum("BTD,NDR->BTNR", x, lora_a)
+        low_rank *= gate[:, None, :, None].astype(dtype)
+        delta = jnp.einsum("BTNR,NRH->BTNH", low_rank, lora_b)
+        return delta * jnp.asarray(self.alpha / self.rank, dtype=dtype)
+
+
 @at.typecheck
 class Attention(nn.Module):
     """Attention module."""
 
     configs: Sequence[Config]
+    action_conditioning_config: _overview_action_conditioning.OverviewActionConditioningConfig
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache):
+    def __call__(self, xs, positions, attn_mask, kv_cache, action_conditioning):
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
@@ -180,7 +208,7 @@ class Attention(nn.Module):
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0, 1)),
                     lora_config=config.lora_configs.get("attn"),
                 )
-                qkvs.append(qkv_einsum("BSD,3KDH->3BSKH", x))
+                q, k, v = qkv_einsum("BSD,3KDH->3BSKH", x)
             else:
                 q_einsum = lora.Einsum(
                     shape=(config.num_heads, config.width, config.head_dim),
@@ -196,7 +224,21 @@ class Attention(nn.Module):
                     lora_config=config.lora_configs.get("attn"),
                 )
                 k, v = kv_einsum("BSD,2KDH->2BSKH", x)
-                qkvs.append((q, k, v))
+
+            if (
+                self.action_conditioning_config.enabled
+                and self.action_conditioning_config.target in ("q", "q_o")
+                and i == 1
+            ):
+                q += ConditionalQueryLoRA(
+                    width=config.width,
+                    num_heads=config.num_heads,
+                    head_dim=config.head_dim,
+                    rank=self.action_conditioning_config.rank,
+                    alpha=self.action_conditioning_config.lora_alpha,
+                    name=_name("conditional_q_lora", i),
+                )(x, action_conditioning[:, 0])
+            qkvs.append((q, k, v))
 
         q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))
 
@@ -285,16 +327,30 @@ class Block(nn.Module):
     """Transformer block."""
 
     configs: tuple[Config, ...]
+    action_conditioning_config: _overview_action_conditioning.OverviewActionConditioningConfig
 
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
+    def __call__(
+        self,
+        xs,
+        kv_cache,
+        positions,
+        attn_mask,
+        adarms_cond,
+        action_conditioning,
+        deterministic=True,  # noqa: FBT002
+    ):
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
-        attn = Attention(configs=self.configs, name="attn")
+        attn = Attention(
+            configs=self.configs,
+            action_conditioning_config=self.action_conditioning_config,
+            name="attn",
+        )
 
         pre_attn = []
         gates = []
@@ -305,7 +361,7 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache, action_conditioning)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
@@ -342,6 +398,9 @@ class Module(nn.Module):
 
     configs: Sequence[Config]  # list of configs, one for each expert
     embed_dtype: str
+    action_conditioning_config: _overview_action_conditioning.OverviewActionConditioningConfig = dataclasses.field(
+        default_factory=_overview_action_conditioning.OverviewActionConditioningConfig
+    )
 
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
@@ -359,7 +418,7 @@ class Module(nn.Module):
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
-            static_argnums=(5,),  # 0=self, 6=deterministic
+            static_argnums=(6,),  # 6=deterministic
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -371,11 +430,13 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
+                0,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
+            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=action_conditioning, 5=deterministic
             length=self.configs[0].depth,
         )(
             configs=self.configs,
+            action_conditioning_config=self.action_conditioning_config,
             dropout=self.dropout,
             dropout_bdims=self.dropout_bdims,
         )
@@ -393,6 +454,7 @@ class Module(nn.Module):
         positions: at.Int[at.Array, "b t"],
         mask: at.Bool[at.Array, "b t s"],
         adarms_cond: Sequence[at.Float[at.Array, "b _d"] | None] | None = None,
+        action_conditioning: tuple[at.Float[at.Array, "b l n"], at.Float[at.Array, "b l n"]] | None = None,
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
@@ -401,8 +463,31 @@ class Module(nn.Module):
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
+        if action_conditioning is None:
+            layer_action_conditioning = jnp.zeros(
+                (self.configs[0].depth, positions.shape[0], 2, self.configs[0].num_heads),
+                dtype=self.embed_dtype,
+            )
+        else:
+            q_gates, o_gates = action_conditioning
+            expected_shape = (positions.shape[0], self.configs[0].depth, self.configs[0].num_heads)
+            if q_gates.shape != expected_shape or o_gates.shape != expected_shape:
+                raise ValueError(
+                    f"Expected action conditioning gates with shape {expected_shape}, got "
+                    f"{q_gates.shape} and {o_gates.shape}"
+                )
+            layer_action_conditioning = jnp.stack([q_gates, o_gates], axis=2)
+            layer_action_conditioning = jnp.transpose(layer_action_conditioning, (1, 0, 2, 3)).astype(self.embed_dtype)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        embedded, kv_cache = self.layers(
+            embedded,
+            kv_cache,
+            positions,
+            mask,
+            adarms_cond,
+            layer_action_conditioning,
+            deterministic,
+        )
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 

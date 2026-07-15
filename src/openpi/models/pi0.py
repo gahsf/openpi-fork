@@ -76,6 +76,7 @@ class Pi0(_model.BaseModel):
                 configs=[paligemma_config, action_expert_config],
                 embed_dtype=config.dtype,
                 adarms=config.pi05,
+                action_conditioning_config=config.overview_action_conditioning,
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
@@ -99,6 +100,21 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+        self.overview_action_conditioning = (
+            _overview_action_conditioning.OverviewActionConditioning(
+                config.overview_action_conditioning,
+                vlm_width=paligemma_config.width,
+                action_width=action_expert_config.width,
+                state_dim=config.action_dim,
+                num_views=len(config.fake_obs().images),
+                num_layers=action_expert_config.depth,
+                num_heads=action_expert_config.num_heads,
+                dtype=config.dtype,
+                rngs=rngs,
+            )
+            if config.overview_action_conditioning.enabled
+            else None
+        )
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -143,6 +159,23 @@ class Pi0(_model.BaseModel):
             ar_mask=ar_mask,
             image_lengths=tuple(image_lengths),
             language_length=language_length,
+        )
+
+    def _compute_action_conditioning(
+        self,
+        observation: _model.Observation,
+        prefix: _overview_action_conditioning.PrefixEmbeddings,
+        prefix_out: at.Array,
+    ) -> tuple[at.Array, at.Array] | None:
+        if self.overview_action_conditioning is None:
+            return None
+        image_masks = tuple(observation.image_masks[name] for name in observation.images)
+        return self.overview_action_conditioning(
+            prefix_out,
+            prefix,
+            image_masks,
+            observation.tokenized_prompt_mask,
+            observation.state,
         )
 
     @at.typecheck
@@ -212,7 +245,10 @@ class Pi0(_model.BaseModel):
         prefix = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix.input_mask, prefix.ar_mask)
         prefix_positions = jnp.cumsum(prefix.input_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix.tokens, None], mask=prefix_attn_mask, positions=prefix_positions)
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix.tokens, None], mask=prefix_attn_mask, positions=prefix_positions
+        )
+        action_conditioning = self._compute_action_conditioning(observation, prefix, prefix_out)
 
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
         suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
@@ -225,6 +261,7 @@ class Pi0(_model.BaseModel):
             positions=suffix_positions,
             kv_cache=kv_cache,
             adarms_cond=[None, adarms_cond],
+            action_conditioning=action_conditioning,
         )
         assert prefix_out is None
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
@@ -252,7 +289,10 @@ class Pi0(_model.BaseModel):
         prefix = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix.input_mask, prefix.ar_mask)
         positions = jnp.cumsum(prefix.input_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix.tokens, None], mask=prefix_attn_mask, positions=positions)
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix.tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+        action_conditioning = self._compute_action_conditioning(observation, prefix, prefix_out)
 
         def step(carry):
             x_t, time = carry
@@ -282,6 +322,7 @@ class Pi0(_model.BaseModel):
                 positions=positions,
                 kv_cache=kv_cache,
                 adarms_cond=[None, adarms_cond],
+                action_conditioning=action_conditioning,
             )
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
