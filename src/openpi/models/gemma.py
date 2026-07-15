@@ -181,6 +181,32 @@ class ConditionalQueryLoRA(nn.Module):
         return delta * jnp.asarray(self.alpha / self.rank, dtype=dtype)
 
 
+class ConditionalOutputLoRA(nn.Module):
+    width: int
+    num_heads: int
+    head_dim: int
+    rank: int
+    alpha: float
+
+    @nn.compact
+    def __call__(self, encoded, gate):
+        dtype = encoded.dtype
+        lora_a = self.param(
+            "lora_a",
+            nn.initializers.normal(stddev=0.01),
+            (self.num_heads, self.head_dim, self.rank),
+        ).astype(dtype)
+        lora_b = self.param(
+            "lora_b",
+            nn.initializers.normal(stddev=0.01),
+            (self.num_heads, self.rank, self.width),
+        ).astype(dtype)
+        low_rank = jnp.einsum("BTNH,NHR->BTNR", encoded, lora_a)
+        low_rank *= gate[:, None, :, None].astype(dtype)
+        delta = jnp.einsum("BTNR,NRD->BTD", low_rank, lora_b)
+        return delta * jnp.asarray(self.alpha / self.rank, dtype=dtype)
+
+
 @at.typecheck
 class Attention(nn.Module):
     """Attention module."""
@@ -283,7 +309,22 @@ class Attention(nn.Module):
                     init_fn=nn.initializers.lecun_normal(in_axis=(-3, -2), out_axis=-1),
                     lora_config=config.lora_configs.get("attn"),
                 )
-                out.append(out_einsum("BTNH,NHD->BTD", encoded[:, start:end]))
+                expert_encoded = encoded[:, start:end]
+                expert_out = out_einsum("BTNH,NHD->BTD", expert_encoded)
+                if (
+                    self.action_conditioning_config.enabled
+                    and self.action_conditioning_config.target in ("o", "q_o")
+                    and i == 1
+                ):
+                    expert_out += ConditionalOutputLoRA(
+                        width=config.width,
+                        num_heads=config.num_heads,
+                        head_dim=config.head_dim,
+                        rank=self.action_conditioning_config.rank,
+                        alpha=self.action_conditioning_config.lora_alpha,
+                        name=_name("conditional_o_lora", i),
+                    )(expert_encoded, action_conditioning[:, 1])
+                out.append(expert_out)
                 start = end
             else:
                 out.append(None)

@@ -40,7 +40,7 @@ def test_pi0_lora_model():
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
 
 
-def test_pi0_ocaev1_q_model():
+def test_pi0_ocaev1_qo_model():
     key = jax.random.key(0)
     config = pi0_config.Pi0Config(
         paligemma_variant="dummy",
@@ -49,7 +49,7 @@ def test_pi0_ocaev1_q_model():
             enabled=True,
             rank=2,
             lora_alpha=2.0,
-            target="q",
+            target="q_o",
         ),
     )
     model = config.create(key)
