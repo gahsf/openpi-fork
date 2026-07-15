@@ -14,6 +14,7 @@ from typing_extensions import override
 import tyro
 
 import openpi.models.model as _model
+import openpi.models.overview_action_conditioning as overview_action_conditioning
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
@@ -933,6 +934,34 @@ _CONFIGS = [
     #
     # Debugging configs.
     #
+    TrainConfig(
+        name="pi0_ocaev1_debug",
+        data=FakeDataConfig(),
+        batch_size=1,
+        model=pi0_config.Pi0Config(
+            overview_action_conditioning=overview_action_conditioning.OverviewActionConditioningConfig(
+                enabled=True,
+                rank=16,
+                lora_alpha=16.0,
+                target="q_o",
+            )
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            overview_action_conditioning=overview_action_conditioning.OverviewActionConditioningConfig(
+                enabled=True,
+                rank=16,
+                lora_alpha=16.0,
+                target="q_o",
+            )
+        ).get_freeze_filter(),
+        ema_decay=None,
+        save_interval=1,
+        overwrite=True,
+        exp_name="debug",
+        num_train_steps=10,
+        wandb_enabled=False,
+    ),
     TrainConfig(
         name="debug",
         data=FakeDataConfig(),

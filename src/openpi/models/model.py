@@ -234,9 +234,16 @@ class BaseModelConfig(abc.ABC):
         """Create a model with the given parameters."""
         model = nnx.eval_shape(self.create, jax.random.key(0))
         graphdef, state = nnx.split(model)
+        expected_params = state.to_pure_dict()
         if remove_extra_params:
-            params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
-        at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
+            params = ocp.transform_utils.intersect_trees(expected_params, params)
+            # NNX uses None leaves for disabled parameters, but intersect_trees drops them.
+            flat_params = traverse_util.flatten_dict(params)
+            for path, value in traverse_util.flatten_dict(expected_params).items():
+                if value is None:
+                    flat_params.setdefault(path, value)
+            params = traverse_util.unflatten_dict(flat_params)
+        at.check_pytree_equality(expected=expected_params, got=params, check_shapes=True, check_dtypes=False)
         state.replace_by_pure_dict(params)
         return nnx.merge(graphdef, state)
 
