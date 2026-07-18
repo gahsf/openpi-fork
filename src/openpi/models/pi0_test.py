@@ -79,6 +79,29 @@ def test_pi0_ocaev1_parameter_tree(target, expects_q, expects_o):
     assert any("conditional_o_lora_1" in path for path in paths) is expects_o
 
 
+def test_pi0_static_qo_has_only_conditional_lora_trainable_params():
+    config = _pi0_config.Pi0Config(
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        overview_action_conditioning=_overview_action_conditioning.OverviewActionConditioningConfig(
+            enabled=True,
+            rank=2,
+            lora_alpha=2.0,
+            target="q_o",
+            conditioning_mode="static",
+        ),
+    )
+    abstract_model = nnx.eval_shape(config.create, jax.random.key(0))
+    trainable_paths = [
+        "/".join(str(part) for part in path)
+        for path in nnx.state(abstract_model, nnx.All(nnx.Param, nnx.Not(config.get_freeze_filter()))).flat_state()
+    ]
+
+    assert trainable_paths
+    assert all("conditional_q_lora_1" in path or "conditional_o_lora_1" in path for path in trainable_paths)
+    assert not any("overview_action_conditioning" in path for path in trainable_paths)
+
+
 @pytest.mark.parametrize(
     ("target", "expects_q", "expects_o"),
     [

@@ -15,6 +15,7 @@ class OverviewActionConditioningConfig:
     rank: int = 16
     lora_alpha: float = 16.0
     target: Literal["q", "o", "q_o"] = "q_o"
+    conditioning_mode: Literal["sample", "constant", "static"] = "sample"
     use_state_context: bool = True
 
     def __post_init__(self):
@@ -24,6 +25,10 @@ class OverviewActionConditioningConfig:
             raise ValueError(f"lora_alpha must be positive, got {self.lora_alpha}")
         if self.target not in ("q", "o", "q_o"):
             raise ValueError(f"target must be one of q/o/q_o, got {self.target!r}")
+        if self.conditioning_mode not in ("sample", "constant", "static"):
+            raise ValueError(f"conditioning_mode must be one of sample/constant/static, got {self.conditioning_mode!r}")
+        if not self.enabled and self.conditioning_mode != "sample":
+            raise ValueError("conditioning_mode requires overview action conditioning to be enabled")
 
 
 @struct.dataclass
@@ -39,6 +44,25 @@ def _masked_mean(values: at.Array, mask: at.Array) -> at.Array:
     mask = mask.astype(values.dtype)
     denominator = jnp.maximum(jnp.sum(mask, axis=1, keepdims=True), 1)
     return jnp.sum(values * mask[..., None], axis=1) / denominator
+
+
+def make_constant_reference_inputs(
+    prefix_out: at.Array,
+    image_masks: Sequence[at.Array],
+    language_mask: at.Array | None,
+    state: at.Array,
+) -> tuple[at.Array, tuple[at.Array, ...], at.Array | None, at.Array]:
+    """Creates deterministic nonzero inputs shared by every sample for the constant-context baseline."""
+    token_positions = jnp.arange(1, prefix_out.shape[1] + 1, dtype=jnp.float32)[:, None]
+    feature_positions = jnp.arange(1, prefix_out.shape[2] + 1, dtype=jnp.float32)[None, :]
+    fixed_prefix = jnp.sin(token_positions * feature_positions * 0.01).astype(prefix_out.dtype)
+    fixed_prefix = jnp.broadcast_to(fixed_prefix, prefix_out.shape)
+
+    fixed_image_masks = tuple(jnp.ones_like(mask, dtype=jnp.bool_) for mask in image_masks)
+    fixed_language_mask = None if language_mask is None else jnp.ones_like(language_mask, dtype=jnp.bool_)
+    fixed_state = jnp.sin(jnp.arange(1, state.shape[-1] + 1, dtype=jnp.float32) * 0.5).astype(state.dtype)
+    fixed_state = jnp.broadcast_to(fixed_state, state.shape)
+    return fixed_prefix, fixed_image_masks, fixed_language_mask, fixed_state
 
 
 class OverviewContextEncoder(nnx.Module):

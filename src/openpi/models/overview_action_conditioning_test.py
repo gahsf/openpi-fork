@@ -109,6 +109,24 @@ def test_disabled_state_context_returns_zeros():
     np.testing.assert_array_equal(state_context, jnp.zeros((2, 6), dtype=jnp.float32))
 
 
+def test_constant_reference_inputs_ignore_samples_and_remain_nonzero():
+    prefix_out = jnp.arange(56, dtype=jnp.float32).reshape(2, 7, 4)
+    image_masks = (jnp.array([True, False]), jnp.array([False, True]))
+    language_mask = jnp.array([[True, True, False], [False, True, True]])
+    state = jnp.arange(10, dtype=jnp.float32).reshape(2, 5)
+
+    fixed_prefix, fixed_image_masks, fixed_language_mask, fixed_state = oac.make_constant_reference_inputs(
+        prefix_out, image_masks, language_mask, state
+    )
+
+    np.testing.assert_array_equal(fixed_prefix[0], fixed_prefix[1])
+    np.testing.assert_array_equal(fixed_state[0], fixed_state[1])
+    assert bool(jnp.any(fixed_prefix != 0))
+    assert bool(jnp.any(fixed_state != 0))
+    assert all(bool(jnp.all(mask)) for mask in fixed_image_masks)
+    assert bool(jnp.all(fixed_language_mask))
+
+
 def test_conditioning_respects_bfloat16_dtype():
     conditioning = _make_conditioning(dtype="bfloat16")
     prefix = _make_prefix()
@@ -159,6 +177,10 @@ def test_config_validation_and_pi0_default():
         oac.OverviewActionConditioningConfig(lora_alpha=0)
     with pytest.raises(ValueError, match="target"):
         oac.OverviewActionConditioningConfig(target="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="conditioning_mode"):
+        oac.OverviewActionConditioningConfig(conditioning_mode="invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="enabled"):
+        oac.OverviewActionConditioningConfig(enabled=False, conditioning_mode="static")
     with pytest.raises(ValueError, match="pi05"):
         pi0_config.Pi0Config(pi05=True, overview_action_conditioning=oac.OverviewActionConditioningConfig(enabled=True))
     with pytest.raises(ValueError, match="LoRA"):

@@ -22,6 +22,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -557,6 +558,70 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+def _pi0_libero_experiment_data() -> LeRobotLiberoDataConfig:
+    return LeRobotLiberoDataConfig(
+        repo_id="physical-intelligence/libero",
+        assets=AssetsConfig(
+            assets_dir="./assets/pi0_libero_e7_ocae_qo",
+            asset_id="physical-intelligence/libero",
+        ),
+        base_config=DataConfig(prompt_from_task=True),
+        extra_delta_transform=True,
+    )
+
+
+def _pi0_libero_experiment_schedule() -> _optimizer.CosineDecaySchedule:
+    return _optimizer.CosineDecaySchedule(
+        warmup_steps=1_000,
+        peak_lr=1e-5,
+        decay_steps=30_000,
+        decay_lr=1e-6,
+    )
+
+
+def _pi0_ocaev1_libero_config(
+    name: str,
+    *,
+    target: Literal["q", "o", "q_o"],
+    conditioning_mode: Literal["sample", "constant", "static"] = "sample",
+) -> TrainConfig:
+    model = pi0_config.Pi0Config(
+        overview_action_conditioning=overview_action_conditioning.OverviewActionConditioningConfig(
+            enabled=True,
+            rank=16,
+            lora_alpha=16.0,
+            target=target,
+            conditioning_mode=conditioning_mode,
+        )
+    )
+    return TrainConfig(
+        name=name,
+        model=model,
+        data=_pi0_libero_experiment_data(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        freeze_filter=model.get_freeze_filter(),
+        lr_schedule=_pi0_libero_experiment_schedule(),
+        ema_decay=None,
+        batch_size=32,
+        num_train_steps=30_000,
+    )
+
+
+def _pi0_libero_action_lora_config() -> TrainConfig:
+    model = pi0_config.Pi0Config(action_expert_variant="gemma_300m_lora")
+    return TrainConfig(
+        name="pi0_libero_e0_action_lora",
+        model=model,
+        data=_pi0_libero_experiment_data(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        freeze_filter=nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+        lr_schedule=_pi0_libero_experiment_schedule(),
+        ema_decay=None,
+        batch_size=32,
+        num_train_steps=30_000,
+    )
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -697,6 +762,12 @@ _CONFIGS = [
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
     ),
+    _pi0_libero_action_lora_config(),
+    _pi0_ocaev1_libero_config("pi0_libero_e1_static_qo", target="q_o", conditioning_mode="static"),
+    _pi0_ocaev1_libero_config("pi0_libero_e2_constant_qo", target="q_o", conditioning_mode="constant"),
+    _pi0_ocaev1_libero_config("pi0_libero_e5_ocae_q", target="q"),
+    _pi0_ocaev1_libero_config("pi0_libero_e6_ocae_o", target="o"),
+    _pi0_ocaev1_libero_config("pi0_libero_e7_ocae_qo", target="q_o"),
     TrainConfig(
         name="pi0_fast_libero",
         # Here is an example of loading a pi0-FAST model for full finetuning.

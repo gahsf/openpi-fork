@@ -161,6 +161,7 @@ class ConditionalQueryLoRA(nn.Module):
     head_dim: int
     rank: int
     alpha: float
+    zero_init_b: bool = False
 
     @nn.compact
     def __call__(self, x, gate):
@@ -172,7 +173,7 @@ class ConditionalQueryLoRA(nn.Module):
         ).astype(dtype)
         lora_b = self.param(
             "lora_b",
-            nn.initializers.normal(stddev=0.01),
+            nn.initializers.zeros_init() if self.zero_init_b else nn.initializers.normal(stddev=0.01),
             (self.num_heads, self.rank, self.head_dim),
         ).astype(dtype)
         low_rank = jnp.einsum("BTD,NDR->BTNR", x, lora_a)
@@ -187,6 +188,7 @@ class ConditionalOutputLoRA(nn.Module):
     head_dim: int
     rank: int
     alpha: float
+    zero_init_b: bool = False
 
     @nn.compact
     def __call__(self, encoded, gate):
@@ -198,7 +200,7 @@ class ConditionalOutputLoRA(nn.Module):
         ).astype(dtype)
         lora_b = self.param(
             "lora_b",
-            nn.initializers.normal(stddev=0.01),
+            nn.initializers.zeros_init() if self.zero_init_b else nn.initializers.normal(stddev=0.01),
             (self.num_heads, self.rank, self.width),
         ).astype(dtype)
         low_rank = jnp.einsum("BTNH,NHR->BTNR", encoded, lora_a)
@@ -262,6 +264,7 @@ class Attention(nn.Module):
                     head_dim=config.head_dim,
                     rank=self.action_conditioning_config.rank,
                     alpha=self.action_conditioning_config.lora_alpha,
+                    zero_init_b=self.action_conditioning_config.conditioning_mode == "static",
                     name=_name("conditional_q_lora", i),
                 )(x, action_conditioning[:, 0])
             qkvs.append((q, k, v))
@@ -322,6 +325,7 @@ class Attention(nn.Module):
                         head_dim=config.head_dim,
                         rank=self.action_conditioning_config.rank,
                         alpha=self.action_conditioning_config.lora_alpha,
+                        zero_init_b=self.action_conditioning_config.conditioning_mode == "static",
                         name=_name("conditional_o_lora", i),
                     )(expert_encoded, action_conditioning[:, 1])
                 out.append(expert_out)

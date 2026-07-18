@@ -68,8 +68,12 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.action_conditioning_mode = config.overview_action_conditioning.conditioning_mode
+        self.action_conditioning_dtype = config.dtype
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
+        self.action_conditioning_layers = action_expert_config.depth
+        self.action_conditioning_heads = action_expert_config.num_heads
         # TODO: rewrite gemma in NNX. For now, use bridge.
         llm = nnx_bridge.ToNNX(
             _gemma.Module(
@@ -113,6 +117,7 @@ class Pi0(_model.BaseModel):
                 rngs=rngs,
             )
             if config.overview_action_conditioning.enabled
+            and config.overview_action_conditioning.conditioning_mode != "static"
             else None
         )
 
@@ -167,15 +172,32 @@ class Pi0(_model.BaseModel):
         prefix: _overview_action_conditioning.PrefixEmbeddings,
         prefix_out: at.Array,
     ) -> tuple[at.Array, at.Array] | None:
+        if self.action_conditioning_mode == "static":
+            gates = jnp.ones(
+                (prefix_out.shape[0], self.action_conditioning_layers, self.action_conditioning_heads),
+                dtype=self.action_conditioning_dtype,
+            )
+            return gates, gates
         if self.overview_action_conditioning is None:
             return None
         image_masks = tuple(observation.image_masks[name] for name in observation.images)
+        language_mask = observation.tokenized_prompt_mask
+        state = observation.state
+        if self.action_conditioning_mode == "constant":
+            prefix_out, image_masks, language_mask, state = (
+                _overview_action_conditioning.make_constant_reference_inputs(
+                    prefix_out,
+                    image_masks,
+                    language_mask,
+                    state,
+                )
+            )
         return self.overview_action_conditioning(
             prefix_out,
             prefix,
             image_masks,
-            observation.tokenized_prompt_mask,
-            observation.state,
+            language_mask,
+            state,
         )
 
     @at.typecheck

@@ -38,6 +38,50 @@ def test_disabled_model_has_no_conditional_query_parameters():
     assert not _conditional_param_leaves(params, "o")
 
 
+def test_static_query_lora_zero_initialization_and_gradient():
+    module = gemma.ConditionalQueryLoRA(
+        width=4,
+        num_heads=2,
+        head_dim=3,
+        rank=2,
+        alpha=2.0,
+        zero_init_b=True,
+    )
+    x = jnp.arange(20, dtype=jnp.float32).reshape(1, 5, 4)
+    gate = jnp.ones((1, 2), dtype=jnp.float32)
+    params = module.init(jax.random.key(0), x, gate)
+
+    output = module.apply(params, x, gate)
+    grads = jax.grad(lambda p: jnp.sum(module.apply(p, x, gate)))(params)
+
+    np.testing.assert_array_equal(output, jnp.zeros_like(output))
+    np.testing.assert_array_equal(params["params"]["lora_b"], jnp.zeros((2, 2, 3)))
+    np.testing.assert_array_equal(grads["params"]["lora_a"], jnp.zeros_like(grads["params"]["lora_a"]))
+    assert bool(jnp.any(grads["params"]["lora_b"] != 0))
+
+
+def test_static_output_lora_zero_initialization_and_gradient():
+    module = gemma.ConditionalOutputLoRA(
+        width=4,
+        num_heads=2,
+        head_dim=3,
+        rank=2,
+        alpha=2.0,
+        zero_init_b=True,
+    )
+    encoded = jnp.arange(30, dtype=jnp.float32).reshape(1, 5, 2, 3)
+    gate = jnp.ones((1, 2), dtype=jnp.float32)
+    params = module.init(jax.random.key(0), encoded, gate)
+
+    output = module.apply(params, encoded, gate)
+    grads = jax.grad(lambda p: jnp.sum(module.apply(p, encoded, gate)))(params)
+
+    np.testing.assert_array_equal(output, jnp.zeros_like(output))
+    np.testing.assert_array_equal(params["params"]["lora_b"], jnp.zeros((2, 2, 4)))
+    np.testing.assert_array_equal(grads["params"]["lora_a"], jnp.zeros_like(grads["params"]["lora_a"]))
+    assert bool(jnp.any(grads["params"]["lora_b"] != 0))
+
+
 def test_conditional_query_lora_identity_cache_effect_and_gradients():
     config, model, params = _init_model(enabled=True)
     prefix = jax.random.normal(jax.random.key(1), (1, 4, config.width))

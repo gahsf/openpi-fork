@@ -115,6 +115,51 @@ def test_pi0_ocaev1_smoke_training_config():
     assert config.ema_decay is None
 
 
+@pytest.mark.parametrize(
+    ("name", "target", "conditioning_mode"),
+    [
+        ("pi0_libero_e1_static_qo", "q_o", "static"),
+        ("pi0_libero_e2_constant_qo", "q_o", "constant"),
+        ("pi0_libero_e5_ocae_q", "q", "sample"),
+        ("pi0_libero_e6_ocae_o", "o", "sample"),
+        ("pi0_libero_e7_ocae_qo", "q_o", "sample"),
+    ],
+)
+def test_pi0_ocaev1_libero_experiment_configs(name, target, conditioning_mode):
+    config = training_config.get_config(name)
+
+    assert isinstance(config.model, pi0_config.Pi0Config)
+    assert config.model.overview_action_conditioning.enabled
+    assert config.model.overview_action_conditioning.target == target
+    assert config.model.overview_action_conditioning.conditioning_mode == conditioning_mode
+    assert config.model.overview_action_conditioning.rank == 16
+    assert config.freeze_filter == config.model.get_freeze_filter()
+    assert isinstance(config.data, training_config.LeRobotLiberoDataConfig)
+    assert config.data.repo_id == "physical-intelligence/libero"
+    assert config.data.extra_delta_transform
+    assert config.data.assets.assets_dir == "./assets/pi0_libero_e7_ocae_qo"
+    assert config.data.assets.asset_id == "physical-intelligence/libero"
+    assert isinstance(config.weight_loader, weight_loaders.CheckpointWeightLoader)
+    assert config.batch_size == 32
+    assert config.num_train_steps == 30_000
+    assert config.ema_decay is None
+
+
+def test_pi0_libero_e0_action_lora_config():
+    config = training_config.get_config("pi0_libero_e0_action_lora")
+
+    assert isinstance(config.model, pi0_config.Pi0Config)
+    assert config.model.action_expert_variant == "gemma_300m_lora"
+    assert not config.model.overview_action_conditioning.enabled
+    assert isinstance(config.data, training_config.LeRobotLiberoDataConfig)
+    assert config.data.repo_id == "physical-intelligence/libero"
+    assert config.data.extra_delta_transform
+    assert config.data.assets.assets_dir == "./assets/pi0_libero_e7_ocae_qo"
+    assert config.batch_size == 32
+    assert config.num_train_steps == 30_000
+    assert config.ema_decay is None
+
+
 def test_pi0_ocaev1_train_sample_and_checkpoint_roundtrip(tmp_path):
     key = jax.random.key(0)
     config = _ocaev1_dummy_config()
