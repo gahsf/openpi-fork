@@ -1,5 +1,6 @@
 import collections
 import dataclasses
+import json
 import logging
 import math
 import pathlib
@@ -41,6 +42,8 @@ class Args:
     # Utils
     #################################################################################################################
     video_out_path: str = "data/libero/videos"  # Path to save videos
+    results_out_path: str = "data/libero/results.jsonl"  # Path to save structured rollout results
+    save_videos: bool = True
 
     seed: int = 7  # Random Seed (for reproducibility)
 
@@ -55,7 +58,13 @@ def eval_libero(args: Args) -> None:
     num_tasks_in_suite = task_suite.n_tasks
     logging.info(f"Task suite: {args.task_suite_name}")
 
-    pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+    video_out_path = pathlib.Path(args.video_out_path)
+    results_out_path = pathlib.Path(args.results_out_path)
+    if results_out_path.exists():
+        raise FileExistsError(f"Results file already exists: {results_out_path}. Choose a new --args.results-out-path.")
+    results_out_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.save_videos:
+        video_out_path.mkdir(parents=True, exist_ok=True)
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
@@ -98,9 +107,11 @@ def eval_libero(args: Args) -> None:
 
             # Setup
             t = 0
+            done = False
+            episode_error = None
             replay_images = []
 
-            logging.info(f"Starting episode {task_episodes+1}...")
+            logging.info(f"Starting episode {task_episodes + 1}...")
             while t < max_steps + args.num_steps_wait:
                 try:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -142,9 +153,9 @@ def eval_libero(args: Args) -> None:
 
                         # Query model to get action
                         action_chunk = client.infer(element)["actions"]
-                        assert (
-                            len(action_chunk) >= args.replan_steps
-                        ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
+                        assert len(action_chunk) >= args.replan_steps, (
+                            f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
+                        )
                         action_plan.extend(action_chunk[: args.replan_steps])
 
                     action = action_plan.popleft()
@@ -159,19 +170,34 @@ def eval_libero(args: Args) -> None:
 
                 except Exception as e:
                     logging.error(f"Caught exception: {e}")
+                    episode_error = str(e)
                     break
 
             task_episodes += 1
             total_episodes += 1
 
-            # Save a replay video of the episode
-            suffix = "success" if done else "failure"
-            task_segment = task_description.replace(" ", "_")
-            imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
-                [np.asarray(x) for x in replay_images],
-                fps=10,
-            )
+            if args.save_videos and replay_images:
+                suffix = "success" if done else "failure"
+                video_path = video_out_path / (
+                    f"{args.task_suite_name}_task_{task_id:02d}_episode_{episode_idx:02d}_{suffix}.mp4"
+                )
+                if video_path.exists():
+                    raise FileExistsError(f"Video already exists: {video_path}")
+                imageio.mimwrite(video_path, [np.asarray(x) for x in replay_images], fps=10)
+
+            episode_result = {
+                "record_type": "episode",
+                "task_suite": args.task_suite_name,
+                "task_id": task_id,
+                "task_description": task_description,
+                "episode_idx": episode_idx,
+                "seed": args.seed,
+                "success": bool(done),
+                "steps": t,
+                "error": episode_error,
+            }
+            with results_out_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(episode_result) + "\n")
 
             # Log current results
             logging.info(f"Success: {done}")
@@ -181,9 +207,20 @@ def eval_libero(args: Args) -> None:
         # Log final results
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
+        env.close()
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
+    summary_result = {
+        "record_type": "summary",
+        "task_suite": args.task_suite_name,
+        "seed": args.seed,
+        "total_successes": total_successes,
+        "total_episodes": total_episodes,
+        "success_rate": float(total_successes) / float(total_episodes),
+    }
+    with results_out_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(summary_result) + "\n")
 
 
 def _get_libero_env(task, resolution, seed):
