@@ -311,7 +311,7 @@ checkpoint restore 和 sampling 通过
 ```
 
 Go：三组均通过工程验收。
-No-Go：任一组出现方法特异性的 NaN、freeze 破坏、restore 失败或无法解释的显存异常；先诊断，不启动 30k。
+No-Go：任一组出现 gate 饱和、effective delta 异常、freeze 破坏、NaN、restore 失败或无法解释的显存异常；先诊断，不启动 30k。
 
 ### 7.4 2026-07-21 执行结果
 
@@ -357,7 +357,201 @@ checkpoint 根目录：
 /data1/gqy/checkpoints/ocaev1/pi0_libero_e7_ocae_qo/pilot_seed42_steps1000
 ```
 
-当前结论是训练、保存、恢复和推理链路通过。标准训练日志没有记录 gate、effective delta ratio 和冻结参数 fingerprint，因此完整 R1 Go 判定仍需补齐这三项诊断；不能仅根据相近的 1,000-step training loss 比较 E1/E2/E7 方法效果。
+训练、保存、恢复和推理链路通过。标准训练日志没有记录 gate、effective delta ratio 和冻结参数 fingerprint，因此不能仅根据相近的 1,000-step training loss 比较 E1/E2/E7 方法效果；完整诊断和最终判定见下一节。
+
+### 7.5 Pilot checkpoint 诊断与 Go / No-Go
+
+使用 `scripts/diagnose_ocaev1_pilot.py` 对 step 999 checkpoint 做统一检查：
+
+```text
+真实 LIBERO batch size: 4
+冻结参数: 与 pi0_base 在 checkpoint dtype cast 后逐叶 exact equal
+gate 饱和阈值: |g| > 0.9 的比例必须 < 1%
+effective delta ratio: finite、非零且 < 1
+ratio 定义: ||g * (A @ B) * alpha/rank||F / ||W_base||F
+```
+
+| 配置 | 冻结叶 exact equal | Q `|g|>0.9` | O `|g|>0.9` | Q delta ratio | O delta ratio | 判定 |
+|---|---:|---:|---:|---:|---:|---|
+| E1 static Q/O | 50/50 | static gate=1，不适用 | static gate=1，不适用 | 0.400% | 0.572% | Pass |
+| E2 constant Q/O | 50/50 | 100% | 100% | 1.322% | 1.763% | Fail |
+| E7 sample Q/O | 50/50 | 100% | 100% | 1.321% | 1.762% | Fail |
+
+E2 每个样本使用相同 reference input，样本间 gate 距离为 0 符合基线设计；失败原因是 gate 全饱和，不是冻结参数或数值错误。
+
+E7 做了逐层详细追踪，确认饱和不是诊断取样假象：
+
+```text
+真实 prefix input 相对样本距离: 9.10%
+scene context 相对样本距离: 1.93%
+state context 相对样本距离: 1.24%
+controller hidden 相对样本距离: 0.52%
+step 999 raw Q/O gate 范围: [-4.875, 4.8125]
+step 999 raw Q |g|>3: 100%
+step 999 raw O |g|>3: 98.61%
+tanh 后 Q/O gate 样本距离: 0
+```
+
+输入、encoder context 和 raw gate 都存在样本差异；但 raw gate 量级过大，`tanh` 将差异压成相同的 `±1`。E7 因而失去本实验要验证的 sample-conditioned gate 行为。
+
+饱和随训练加重：
+
+| E7 checkpoint | Q `|g|>0.9` | O `|g|>0.9` | Q raw max abs | O raw max abs |
+|---|---:|---:|---:|---:|
+| step 500 | 58.33% | 84.03% | 2.016 | 1.930 |
+| step 999 | 100% | 100% | 4.875 | 4.875 |
+
+诊断输出：
+
+```text
+/data1/gqy/evals/ocaev1/pilot_diagnostics_20260721/e1.json
+/data1/gqy/evals/ocaev1/pilot_diagnostics_20260721/e2.json
+/data1/gqy/evals/ocaev1/pilot_diagnostics_20260721/e7.json
+/data1/gqy/evals/ocaev1/pilot_diagnostics_20260721/e7_detail.json
+/data1/gqy/evals/ocaev1/pilot_diagnostics_20260721/e7_step500_detail.json
+```
+
+R1 最终判定：**No-Go**。checkpoint 可恢复、输出 finite、冻结参数完整、effective delta 比例有限，但 E2/E7 gate 验收失败。不得使用当前配置启动七组 30k。下一步应先做带逐步 gate 统计的短程受控实验，定位饱和开始的 step，并只验证一个最小的 gate 尺度约束方案；新 pilot 通过同一诊断后才能恢复 30k 计划。
+
+### 7.6 Gate scale 0.25 受控短程试验
+
+只引入一个变量：在进入 `tanh` 前将 controller gate logit 乘以 `0.25`。原 E1/E2/E7 配置继续保持 `1.0`，新配置为 `pi0_libero_e7_ocae_qo_gate025`。选择 `0.25` 的依据是原 E7 step 999 raw gate 最大绝对值 `4.875`；缩放后为 `1.219`，低于 `atanh(0.9)=1.472`。
+
+同时将以下指标接入正常训练前向，每 10 steps 记录一次，不额外执行 prefix 前向：
+
+```text
+q/o_gate_abs_max
+q/o_gate_abs_gt_0_9
+q/o_raw_gate_abs_max
+```
+
+500-step 受控 pilot：
+
+```text
+GPU: physical GPU 0, 1 x RTX 5090
+global batch size: 32
+seed: 42
+schedule: 与原 E7 完全相同
+steps: 500
+checkpoints: 250, 499
+wall time: 约 11 分 39 秒（含首次 JIT，不含最终异步保存）
+```
+
+训练期 gate 轨迹：
+
+| step | Q gate max abs | O gate max abs | Q/O `|g|>0.9` |
+|---:|---:|---:|---:|
+| 0 | 0 | 0 | 0% / 0% |
+| 250 | 0.0373 | 0.0338 | 0% / 0% |
+| 400 | 0.2025 | 0.1939 | 0% / 0% |
+| 490 | 0.4223 | 0.4096 | 0% / 0% |
+
+checkpoint 独立诊断：
+
+| checkpoint | 冻结叶 exact equal | Q gate max | O gate max | Q delta ratio | O delta ratio | 判定 |
+|---|---:|---:|---:|---:|---:|---|
+| step 250 | 50/50 | 0.0378 | 0.0339 | 0.0231% | 0.0291% | Pass |
+| step 499 | 50/50 | 0.4551 | 0.4414 | 0.4070% | 0.5904% | Pass |
+
+step 499 的 Q/O gate 样本间 L2 距离分别为 `0.00720`/`0.00737`，均非零；实际 tanh logit 最大绝对值分别为 `0.4922`/`0.4746`。因此该 checkpoint 同时满足 finite、非饱和、sample-varying、effective delta 非零和冻结参数完整。
+
+产物：
+
+```text
+checkpoint: /data1/gqy/checkpoints/ocaev1/pi0_libero_e7_ocae_qo_gate025/gate025_pilot_seed42_steps500_20260721_v2/{250,499}
+log: /data1/gqy/logs/ocaev1/e7_gate025_pilot_single_gpu_batch32_steps500_20260721_v2.log
+diagnostic: /data1/gqy/evals/ocaev1/pilot_diagnostics_20260721/e7_gate025_step250_detail.json
+diagnostic: /data1/gqy/evals/ocaev1/pilot_diagnostics_20260721/e7_gate025_step499_detail.json
+```
+
+本阶段判定：**500-step gate025 修复候选 Go**。它解决了原 E7 在 step 500 已有 58.33%/84.03% gate 饱和的问题，但尚不等于完整 R1 Go。下一关是按同协议验证 E7 gate025 到 1,000 steps，并补齐 constant E2 gate025 对照；两者通过后才能讨论 30k。
+
+### 7.7 Gate025 扩展到 1,000 steps 的结果
+
+E7 gate025 按相同 seed、global batch、学习率和单卡协议扩展训练。训练在 step 770 左右提前停止，因为 gate 已明确重新饱和：
+
+```text
+step 660: Q/O |g|>0.9 = 0.02% / 0.00%
+step 680: Q/O |g|>0.9 = 2.12% / 4.59%
+step 700: Q/O |g|>0.9 = 17.53% / 36.15%
+step 720: Q/O |g|>0.9 = 45.41% / 77.80%
+step 740: Q/O |g|>0.9 = 70.04% / 96.40%
+step 760: Q/O |g|>0.9 = 82.69% / 98.88%
+step 770: Q/O |g|>0.9 = 86.67% / 99.68%
+```
+
+step 770 时 Q/O gate 最大值为 `0.9883`/`0.9863`，raw gate 最大值为 `2.55`/`2.49`。训练过程中未出现 NaN、OOM 或 CUDA 错误；失败原因单纯是 gate 饱和。该进程已停止，避免无意义地继续到 step 1000。
+
+本阶段判定：**gate025 1000-step No-Go**。`0.25` 只把饱和从原 E7 的约 step 500 延后到约 step 660–770，不能作为正式配置。由于 E7 主方法已经否证该单一尺度方案，不再启动同尺度 E2 gate025；E1/E2/E7 小规模实验仍未全部通过，30k 继续禁止。
+
+### 7.8 Raw gate L2 正则受控试验
+
+固定 gate scale 会被 controller 权重增长补偿，因此改为直接约束进入 `tanh` 前的 raw Q/O gate logits：
+
+```text
+total_loss = task_loss + coefficient * 0.5 * (mean(q_raw^2) + mean(o_raw^2))
+```
+
+训练日志保留原 `loss` 作为 task loss，并新增 `gate_regularization_loss`、`total_loss` 和 Q/O gate 指标。scale 恢复为 `1.0`。静态检查、10 个 controller 测试、5 个配置测试和 Pi0 aux-loss 前向测试均通过；真实 1-step GPU smoke 也已通过。
+
+| 系数 / checkpoint | Q `|g|>0.9` | O `|g|>0.9` | Q/O delta ratio | 判定 |
+|---|---:|---:|---:|---|
+| `1e-3`, step 499 | 6.944% | 11.111% | 0.870% / 1.339% | No-Go，约束过弱 |
+| `1e-2`, step 499 | 0% | 0% | 0.353% / 0.605% | Pass |
+| `1e-2`, step 999 | 1.3889% | 3.4722% | 0.612% / 1.005% | 严格 No-Go |
+
+step 999 的冻结叶仍为 `50/50 exact equal`，Q/O 样本距离非零，说明机制有效且 conditioning 没有退化为常量；但后期仍轻微超过 `<1%` 的严格阈值。因此 `1e-2` 不能进入 30k。
+
+产物：
+
+```text
+1e-3 checkpoint: /data1/gqy/checkpoints/ocaev1/pi0_libero_e7_ocae_qo_gate_l2_1e3/gate_l2_1e3_pilot_seed42_steps500_20260722/499
+1e-3 log: /data1/gqy/logs/ocaev1/e7_gate_l2_1e3_pilot_single_gpu_batch32_steps500_20260722.log
+1e-3 diagnostic: /data1/gqy/evals/ocaev1/pilot_diagnostics_20260722/e7_gate_l2_1e3_step499_detail.json
+1e-2 checkpoint: /data1/gqy/checkpoints/ocaev1/pi0_libero_e7_ocae_qo_gate_l2_1e2/gate_l2_1e2_pilot_seed42_steps500_20260722/999
+1e-2 logs: /data1/gqy/logs/ocaev1/e7_gate_l2_1e2_pilot_single_gpu_batch32_steps500_20260722.log
+             /data1/gqy/logs/ocaev1/e7_gate_l2_1e2_resume_step500_to1000_20260722.log
+1e-2 diagnostic: /data1/gqy/evals/ocaev1/pilot_diagnostics_20260722/e7_gate_l2_1e2_step999_detail.json
+```
+
+`gate_l2_regularization=3e-2` 已按独立 1,000-step 协议完成 E7 sample 和 E2 constant 对照：
+
+| 配置 | Q `|g|>0.9` | O `|g|>0.9` | Q/O delta ratio | freeze | 判定 |
+|---|---:|---:|---:|---:|---|
+| E7 sample, step 999 | 0.6944% | 0% | 0.443% / 0.705% | 50/50 | Pass |
+| E2 constant, step 999 | 0.6944% | 0% | 0.518% / 0.852% | 50/50 | Pass |
+
+E7 Q/O sample distance 非零；E2 sample distance 为零符合 constant 对照定义。两组诊断均为 `passed: true`，训练末期正则损失约占 task loss 的 5%，未见 NaN、OOM、CUDA 或 checkpoint 错误。
+
+```text
+E7 checkpoint: /data1/gqy/checkpoints/ocaev1/pi0_libero_e7_ocae_qo_gate_l2_3e2/gate_l2_3e2_pilot_seed42_steps1000_20260722/999
+E7 log: /data1/gqy/logs/ocaev1/e7_gate_l2_3e2_pilot_single_gpu_batch32_steps1000_20260722.log
+E7 diagnostic: /data1/gqy/evals/ocaev1/pilot_diagnostics_20260722/e7_gate_l2_3e2_step999_detail.json
+E2 checkpoint: /data1/gqy/checkpoints/ocaev1/pi0_libero_e2_constant_qo_gate_l2_3e2/gate_l2_3e2_pilot_seed42_steps1000_20260722/999
+E2 log: /data1/gqy/logs/ocaev1/e2_gate_l2_3e2_pilot_single_gpu_batch32_steps1000_20260722.log
+E2 diagnostic: /data1/gqy/evals/ocaev1/pilot_diagnostics_20260722/e2_gate_l2_3e2_step999_detail.json
+```
+
+截至 2026-07-23，E1 static、修正后的 E2 constant、修正后的 E7 sample 小规模验收全部通过。正式 `pi0_libero_e2_constant_qo` 和 `pi0_libero_e7_ocae_qo` 已统一使用 L2 `3e-2`；R1 gate 准入由 No-Go 更新为 Go，可以进入 seed 42 的 30k staged training，但仍需逐阶段监控 gate 和 task loss。
+
+### 7.9 Seed 42 正式 30k 第一批与 E2 意外恢复
+
+2026-07-23 在三张 GPU 上并行启动 E1/E2/E7 正式 30k。E1 和 E7 均于 step 29999 正常完成并保存 final checkpoint；E7 step 29900 的 Q/O `|g|>0.9` 均为 0%，gate L2 `3e-2` 在长程训练末期仍有效。
+
+E2 于约 step 3990 遇到 `CUDA_ERROR_LAUNCH_FAILED: unspecified launch failure`。错误前 loss、gate 和正则均正常，step 3900 Q/O 饱和率为 0%，因此判定为 GPU/运行时意外，不是模型数值或 gate 失败。原实验目录保留 step 3000 checkpoint 和完整失败日志。
+
+为避免 Orbax 后续自动保留策略删除原始失败现场，2026-07-24 将原 E2 checkpoint 目录完整复制到独立续训目录，再从 step 3000 resume：
+
+```text
+原失败目录: /data1/gqy/checkpoints/ocaev1/pi0_libero_e2_constant_qo/seed42_30k_20260723
+原失败日志: /data1/gqy/logs/ocaev1/e2_constant_qo_gate_l2_3e2_seed42_30k_20260723.log
+续训目录: /data1/gqy/checkpoints/ocaev1/pi0_libero_e2_constant_qo/seed42_30k_resume_from3000_20260724
+续训日志: /data1/gqy/logs/ocaev1/e2_constant_qo_gate_l2_3e2_seed42_30k_resume_from3000_20260724.log
+GPU: physical GPU 2
+launcher PID: 2216
+```
+
+日志已确认 Orbax 从 step 3000 完整恢复约 6.1 GiB 参数和 143.6 MiB train state，并继续进入 step 3000 之后的训练循环。原始失败目录未被修改或覆盖。
 
 ## 8. Phase R2：策略 server—simulator smoke
 
@@ -550,6 +744,54 @@ screening 只作为资源 Go/No-Go 和严重回归检查，不用于选择 check
 ```
 
 评测入口发现已有 `results.jsonl` 会直接报错，防止重复运行覆盖证据。需要重跑时创建新的显式 run 目录，不能删除旧结果。
+
+### 10.4 2026-07-25 E1/E2/E7 完整 benchmark 启动记录
+
+按 final 协议直接启动 E1/E2/E7 三组完整 LIBERO benchmark。每组依次运行 `libero_spatial`、`libero_object`、`libero_goal`、`libero_10`，每 task 50 trials，固定 seed 7，关闭视频；每 checkpoint 2,000 episodes，合计 6,000 episodes。
+
+```text
+E1 server: GPU 2, port 8001, PID 11048
+E2 server: GPU 3, port 8002, PID 11049
+E7 server: GPU 4, port 8003, PID 11050
+E1 orchestrator PID: 12315, start 2026-07-25T04:38:36Z
+E2 orchestrator PID: 12465, start 2026-07-25T04:38:54Z
+E7 orchestrator PID: 12647, start 2026-07-25T04:39:14Z
+```
+
+结果根目录：
+
+```text
+/data1/gqy/evals/ocaev1/full_benchmark_seed42_20260725
+```
+
+日志根目录：
+
+```text
+/data1/gqy/logs/ocaev1/libero_full_benchmark_seed42_20260725
+```
+
+三个 client 均未设置 `CUDA_VISIBLE_DEVICES`，使用历史已验证的 `MUJOCO_GL=egl`、`PYOPENGL_PLATFORM=egl`、`MUJOCO_EGL_DEVICE_ID=0`。三个 WebSocket 连接、LIBERO 环境初始化和 JSONL 写入均已验证。首个 Spatial task 0 episode 三组均运行到 230 steps 后失败，`error=null`；当前只有 1 episode/model，不用于判断最终性能。三路并发下失败 episode 约 159–171 秒，完整运行预计约四天。
+
+### 10.5 2026-07-25 Full benchmark Early Stop
+
+因 Spatial 前两项已出现明显负面趋势，用户要求停止完整 benchmark。已向三个 simulator client、三个 orchestrator 和三个 policy server 发送正常终止信号；所有进程均已退出，GPU server 计算进程已释放，checkpoint、日志和 JSONL 均保留，未删除结果。
+
+停止时最终有效 episode：
+
+| 模型 | episodes | successes | success rate | errors | task 分布 |
+|---|---:|---:|---:|---:|---|
+| E1 static | 105 | 2 | 1.90% | 0 | task0=50, task1=50, task2=5 |
+| E2 constant | 104 | 0 | 0% | 0 | task0=50, task1=50, task2=4 |
+| E7 sample | 103 | 7 | 6.80% | 0 | task0=50, task1=50, task2=3 |
+
+已完整完成的前两个 Spatial task 上，E1 为 2/100、E2 为 0/100、E7 为 7/100。所有失败记录均 `error=null`，说明不是 EGL、WebSocket 或 simulator 异常，而是策略未完成任务。当前结果不足以报告完整 LIBERO benchmark，但已足以判定继续消耗约四天运行 6,000 episodes 的收益过低，因此 Early Stop 合理。
+
+保留证据：
+
+```text
+/data1/gqy/evals/ocaev1/full_benchmark_seed42_20260725
+/data1/gqy/logs/ocaev1/libero_full_benchmark_seed42_20260725
+```
 
 ## 11. Phase R5：Go / No-Go 与多 seed
 

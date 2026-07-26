@@ -1,8 +1,8 @@
 # OpenPI OCAE V1 会话交接文档
 
-> 更新时间：2026-07-21
+> 更新时间：2026-07-25
 > 用途：下次会话开始时优先读取本文，快速恢复项目目标、设计约束、代码进度、验证证据和下一步工作。
-> 当前结论：OCAE V1 的 P1–P9 工程实现已完成；真实 LIBERO 数据、归一化、端到端 smoke 及 E1/E2/E7 1,000-step pilot 均已通过。正式 30k 训练和 OCAE benchmark rollout 尚未开始。
+> 当前结论：E1/E2/E7 30k 与 checkpoint 工程验收通过，但完整 LIBERO rollout 在 Spatial 前两个 task 上成功率仅 E1=2%、E2=0%、E7=7%。2026-07-25 已按用户要求 Early Stop；所有测评进程已退出，结果与日志完整保留。当前主要问题已从 gate 饱和转为策略实际任务成功率过低。
 
 ## 1. 仓库与运行环境
 
@@ -455,6 +455,123 @@ checkpoint：
 
 多卡结论：两卡 FSDP 在 RTX 5090 上触发 CUDA illegal address；两卡纯数据并行在完整训练图首次 collective/JIT 调用停止推进。`NCCL_CUMEM_HOST_ENABLE=0` 仅让独立 `psum` 探针通过，未解决完整训练图。因此三组统一使用单卡，同时保持 global batch、seed、schedule 和 steps 不变。
 
+Pilot checkpoint 诊断：
+
+| 配置 | 冻结叶 exact equal | Q `|g|>0.9` | O `|g|>0.9` | Q delta ratio | O delta ratio | 判定 |
+|---|---:|---:|---:|---:|---:|---|
+| E1 static Q/O | 50/50 | static，不适用 | static，不适用 | 0.400% | 0.572% | Pass |
+| E2 constant Q/O | 50/50 | 100% | 100% | 1.322% | 1.763% | Fail |
+| E7 sample Q/O | 50/50 | 100% | 100% | 1.321% | 1.762% | Fail |
+
+E7 真实输入和 encoder 输出存在样本差异；step 999 raw Q/O gate 已达到约 `[-4.875, 4.8125]`，经过 `tanh` 后样本 gate 全部变为相同的 `±1`。这不是取样或恢复假象。step 500 时 Q/O 的 `|g|>0.9` 比例已经分别达到 58.33%/84.03%，说明饱和随训练加重。
+
+R1 最终判定：**No-Go**。冻结参数完整、effective delta 有限、checkpoint restore 和 sampling 正常，但 E2/E7 gate 验收失败。当前配置不得启动七组 30k。
+
+诊断脚本和输出：
+
+```text
+scripts/diagnose_ocaev1_pilot.py
+/data1/gqy/evals/ocaev1/pilot_diagnostics_20260721/e1.json
+/data1/gqy/evals/ocaev1/pilot_diagnostics_20260721/e2.json
+/data1/gqy/evals/ocaev1/pilot_diagnostics_20260721/e7.json
+/data1/gqy/evals/ocaev1/pilot_diagnostics_20260721/e7_detail.json
+/data1/gqy/evals/ocaev1/pilot_diagnostics_20260721/e7_step500_detail.json
+```
+
+Gate scale 0.25 修复候选：
+
+```text
+config: pi0_libero_e7_ocae_qo_gate025
+唯一训练行为变化: tanh 前 gate logit 乘以 0.25
+global batch size: 32
+seed: 42
+steps: 500
+GPU: physical GPU 0
+checkpoints: 250, 499
+```
+
+训练日志每 10 steps 直接记录 Q/O gate max、`|g|>0.9` 比例和 raw gate max。step 490 时 Q/O gate max 为 `0.4223`/`0.4096`，饱和比例始终为 0。
+
+| checkpoint | 冻结叶 exact equal | Q gate max | O gate max | Q delta ratio | O delta ratio | 判定 |
+|---|---:|---:|---:|---:|---:|---|
+| step 250 | 50/50 | 0.0378 | 0.0339 | 0.0231% | 0.0291% | Pass |
+| step 499 | 50/50 | 0.4551 | 0.4414 | 0.4070% | 0.5904% | Pass |
+
+step 499 的 Q/O gate 样本距离非零，说明 sample conditioning 没有被 `tanh` 抹平。本阶段为 **500-step gate025 修复候选 Go**；完整 R1 仍是 No-Go，必须继续验证 E7 gate025 1,000 steps 并补 E2 gate025。
+
+```text
+checkpoint: /data1/gqy/checkpoints/ocaev1/pi0_libero_e7_ocae_qo_gate025/gate025_pilot_seed42_steps500_20260721_v2/{250,499}
+log: /data1/gqy/logs/ocaev1/e7_gate025_pilot_single_gpu_batch32_steps500_20260721_v2.log
+diagnostics: /data1/gqy/evals/ocaev1/pilot_diagnostics_20260721/e7_gate025_step{250,499}_detail.json
+```
+
+E7 gate025 扩展训练失败记录：
+
+```text
+exp: gate025_pilot_seed42_steps1000_20260721_v3
+log: /data1/gqy/logs/ocaev1/e7_gate025_pilot_single_gpu_batch32_steps1000_20260721_v3.log
+step 700: Q/O |g|>0.9 = 17.53% / 36.15%
+step 750: Q/O |g|>0.9 = 76.83% / 98.28%
+step 770: Q/O |g|>0.9 = 86.67% / 99.68%
+结论: gate025 延迟但没有消除饱和；训练已停止，不启动同尺度 E2。
+```
+
+Raw gate L2 正则试验（2026-07-22）：
+
+```text
+实现: total_loss = task_loss + gate_regularization_loss；loss 继续表示 task loss
+1e-3 step 499: Q/O |g|>0.9 = 6.944% / 11.111%，No-Go
+1e-2 step 499: Q/O |g|>0.9 = 0% / 0%，Pass
+1e-2 step 999: Q/O |g|>0.9 = 1.3889% / 3.4722%，严格 No-Go
+step 999: freeze 50/50 exact equal，Q/O sample distance 非零
+验证: ruff passed；controller 10 tests、gate config 5 tests、Pi0 aux-loss test passed；真实 1-step GPU smoke passed
+```
+
+`3e-2` 最终结果：E7 step 999 Q/O 饱和率为 0.6944%/0%，delta 为 0.443%/0.705%；E2 step 999 为 0.6944%/0%，delta 为 0.518%/0.852%。两组 freeze 均为 50/50，诊断均 `passed: true`。E7 sample distance 非零；E2 为零符合 constant 定义。正式 `pi0_libero_e2_constant_qo` 和 `pi0_libero_e7_ocae_qo` 已切换到 L2 `3e-2`。
+
+Seed 42 正式训练最新记录（2026-07-24）：
+
+```text
+E1: 30k 完成，final checkpoint step 29999
+E7: 30k 完成，final checkpoint step 29999；step 29900 Q/O |g|>0.9 = 0% / 0%
+E2: 原进程约 step 3990 遇到 CUDA_ERROR_LAUNCH_FAILED
+E2 原 checkpoint: .../pi0_libero_e2_constant_qo/seed42_30k_20260723/3000
+E2 续训 checkpoint root: .../pi0_libero_e2_constant_qo/seed42_30k_resume_from3000_20260724
+E2 续训日志: /data1/gqy/logs/ocaev1/e2_constant_qo_gate_l2_3e2_seed42_30k_resume_from3000_20260724.log
+E2 resume: GPU 2，launcher PID 2216，已确认从 step 3000 restore 并继续递增
+```
+
+恢复采用“复制原 checkpoint 到新实验目录后 resume”，因此原始失败目录与日志保持不变，后续 Orbax 清理只影响续训副本。
+
+完整 LIBERO benchmark 最新记录（2026-07-25）：
+
+```text
+协议: spatial/object/goal/libero_10；50 trials/task；seed 7；无视频
+E1: server GPU2 port8001 PID11048；orchestrator PID12315
+E2: server GPU3 port8002 PID11049；orchestrator PID12465
+E7: server GPU4 port8003 PID11050；orchestrator PID12647
+results: /data1/gqy/evals/ocaev1/full_benchmark_seed42_20260725
+logs: /data1/gqy/logs/ocaev1/libero_full_benchmark_seed42_20260725
+```
+
+三组均已连接 server、初始化 Spatial task 0 并写入首条 episode JSONL。首条均为 230 steps failure、`error=null`；样本数仅 1，不作效果判断。按当前三路并发速度，完整 6,000 episodes 预计约四天。
+
+LIBERO Early Stop 最终记录（2026-07-25）：
+
+```text
+E1: 105 episodes, 2 successes, 1.90%, errors=0
+E2: 104 episodes, 0 successes, 0%, errors=0
+E7: 103 episodes, 7 successes, 6.80%, errors=0
+completed task0+task1: E1 2/100, E2 0/100, E7 7/100
+```
+
+三个 simulator client、orchestrator 和 policy server 已全部停止。失败 episode 均 `error=null`，属于策略失败而非测评链路失败。保留目录：
+
+```text
+/data1/gqy/evals/ocaev1/full_benchmark_seed42_20260725
+/data1/gqy/logs/ocaev1/libero_full_benchmark_seed42_20260725
+```
+
 详细方案和本轮证据见：
 
 ```text
@@ -623,16 +740,14 @@ E13: shuffled images/views
 
 ## 14. 当前最合理的下一步
 
-如果下次会话要继续代码/实验，按以下顺序执行：
+1. 检查最终代码差异和测试结果，不要提交或还原用户的 `uv.lock`、`AGENTS.md` 和 `.libero/`。
+2. 核验七组正式配置，确认只有 E2/E7 使用已验收的 gate L2 `3e-2`，其他实验变量保持不变。
+3. 使用 seed 42 启动 30k staged training；先按资源情况安排作业，最多三张 GPU，不使用 `--overwrite`，每个配置使用独立 checkpoint 目录。
+4. 训练期持续监控 task `loss`、`gate_regularization_loss`、`total_loss`、Q/O 饱和率、raw gate max、显存和错误日志。
+5. 中间 checkpoint 必须执行 freeze、gate、effective delta 和 restore 诊断；出现 gate 超过阈值或 task loss 明显恶化时停止对应作业。
+6. seed 42 训练和 checkpoint 验收完成后，使用固定 rollout seed、task order 和 initial states 做 staged rollout；趋势合理后再补 seed 43/44。
 
-1. 检查 `git status`，不要提交或还原本地 `uv.lock` 和 `.libero/config.yaml`。
-2. 基于 pilot checkpoint 补齐 gate、effective delta ratio 和冻结参数 fingerprint 诊断。
-3. 诊断通过后，按统一协议启动 seed 42 七组 30k 正式训练。
-4. 使用固定 rollout seed、task order 和 initial states 做 Seed 42 staged rollout。
-5. rollout 显示 E7 相对 E1/E2 有合理趋势后，再补 seed 43/44。
-6. 最后执行四个 suite 的 50 trials/task benchmark 和统计报告。
-
-当前没有必要继续修改 OCAE 核心代码。不要仅凭相近的 1,000-step training loss 比较方法效果，也不要在 gate/freeze 诊断完成前启动七组 30k。
+当前 `3e-2` 已是正式 E2/E7 配置，不再是未验收候选；但 1,000-step Go 不等于 30k 最终成功，长程训练仍需阶段性验收。
 
 ## 15. 常用检查命令
 
