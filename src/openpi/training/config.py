@@ -584,6 +584,10 @@ def _pi0_ocaev1_libero_config(
     *,
     target: Literal["q", "o", "q_o"],
     conditioning_mode: Literal["sample", "constant", "static"] = "sample",
+    gate_logit_scale: float = 1.0,
+    gate_l2_regularization: float = 0.0,
+    num_train_steps: int = 30_000,
+    save_interval: int = 1000,
 ) -> TrainConfig:
     model = pi0_config.Pi0Config(
         overview_action_conditioning=overview_action_conditioning.OverviewActionConditioningConfig(
@@ -592,6 +596,8 @@ def _pi0_ocaev1_libero_config(
             lora_alpha=16.0,
             target=target,
             conditioning_mode=conditioning_mode,
+            gate_logit_scale=gate_logit_scale,
+            gate_l2_regularization=gate_l2_regularization,
         )
     )
     return TrainConfig(
@@ -603,7 +609,8 @@ def _pi0_ocaev1_libero_config(
         lr_schedule=_pi0_libero_experiment_schedule(),
         ema_decay=None,
         batch_size=32,
-        num_train_steps=30_000,
+        num_train_steps=num_train_steps,
+        save_interval=save_interval,
     )
 
 
@@ -764,10 +771,33 @@ _CONFIGS = [
     ),
     _pi0_libero_action_lora_config(),
     _pi0_ocaev1_libero_config("pi0_libero_e1_static_qo", target="q_o", conditioning_mode="static"),
-    _pi0_ocaev1_libero_config("pi0_libero_e2_constant_qo", target="q_o", conditioning_mode="constant"),
+    _pi0_ocaev1_libero_config(
+        "pi0_libero_e2_constant_qo", target="q_o", conditioning_mode="constant", gate_l2_regularization=3e-2
+    ),
+    _pi0_ocaev1_libero_config(
+        "pi0_libero_e2_constant_qo_gate025", target="q_o", conditioning_mode="constant", gate_logit_scale=0.25
+    ),
+    _pi0_ocaev1_libero_config(
+        "pi0_libero_e2_constant_qo_gate_l2_3e2",
+        target="q_o",
+        conditioning_mode="constant",
+        gate_l2_regularization=3e-2,
+        num_train_steps=1_000,
+        save_interval=1_000,
+    ),
     _pi0_ocaev1_libero_config("pi0_libero_e5_ocae_q", target="q"),
     _pi0_ocaev1_libero_config("pi0_libero_e6_ocae_o", target="o"),
-    _pi0_ocaev1_libero_config("pi0_libero_e7_ocae_qo", target="q_o"),
+    _pi0_ocaev1_libero_config("pi0_libero_e7_ocae_qo", target="q_o", gate_l2_regularization=3e-2),
+    _pi0_ocaev1_libero_config("pi0_libero_e7_ocae_qo_gate025", target="q_o", gate_logit_scale=0.25),
+    _pi0_ocaev1_libero_config("pi0_libero_e7_ocae_qo_gate_l2_1e3", target="q_o", gate_l2_regularization=1e-3),
+    _pi0_ocaev1_libero_config("pi0_libero_e7_ocae_qo_gate_l2_1e2", target="q_o", gate_l2_regularization=1e-2),
+    _pi0_ocaev1_libero_config(
+        "pi0_libero_e7_ocae_qo_gate_l2_3e2",
+        target="q_o",
+        gate_l2_regularization=3e-2,
+        num_train_steps=1_000,
+        save_interval=1_000,
+    ),
     TrainConfig(
         name="pi0_fast_libero",
         # Here is an example of loading a pi0-FAST model for full finetuning.

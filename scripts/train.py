@@ -147,15 +147,19 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        chunked_loss, aux = model.compute_loss_with_aux(rng, observation, actions, train=True)
+        task_loss = jnp.mean(chunked_loss)
+        regularization_loss = aux.get("gate_regularization_loss", jnp.zeros_like(task_loss))
+        return task_loss + regularization_loss, (task_loss, aux)
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (total_loss, (loss, aux)), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -185,8 +189,10 @@ def train_step(
     )
     info = {
         "loss": loss,
+        "total_loss": total_loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        **aux,
     }
     return new_state, info
 

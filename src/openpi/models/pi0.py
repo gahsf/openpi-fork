@@ -172,14 +172,26 @@ class Pi0(_model.BaseModel):
         prefix: _overview_action_conditioning.PrefixEmbeddings,
         prefix_out: at.Array,
     ) -> tuple[at.Array, at.Array] | None:
+        gates, _ = self._compute_action_conditioning_with_logits(observation, prefix, prefix_out)
+        return gates
+
+    def _compute_action_conditioning_with_logits(
+        self,
+        observation: _model.Observation,
+        prefix: _overview_action_conditioning.PrefixEmbeddings,
+        prefix_out: at.Array,
+    ) -> tuple[
+        tuple[at.Array, at.Array] | None,
+        tuple[at.Array, at.Array] | None,
+    ]:
         if self.action_conditioning_mode == "static":
             gates = jnp.ones(
                 (prefix_out.shape[0], self.action_conditioning_layers, self.action_conditioning_heads),
                 dtype=self.action_conditioning_dtype,
             )
-            return gates, gates
+            return (gates, gates), None
         if self.overview_action_conditioning is None:
-            return None
+            return None, None
         image_masks = tuple(observation.image_masks[name] for name in observation.images)
         language_mask = observation.tokenized_prompt_mask
         state = observation.state
@@ -192,13 +204,11 @@ class Pi0(_model.BaseModel):
                     state,
                 )
             )
-        return self.overview_action_conditioning(
-            prefix_out,
-            prefix,
-            image_masks,
-            language_mask,
-            state,
+        scene_context = self.overview_action_conditioning.encode_overview(
+            prefix_out, prefix, image_masks, language_mask
         )
+        state_context = self.overview_action_conditioning.encode_state(state)
+        return self.overview_action_conditioning.make_gates_with_logits(scene_context, state_context)
 
     @at.typecheck
     def embed_suffix(
@@ -253,6 +263,13 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        loss, _ = self.compute_loss_with_aux(rng, observation, actions, train=train)
+        return loss
+
+    @override
+    def compute_loss_with_aux(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -270,7 +287,9 @@ class Pi0(_model.BaseModel):
         (prefix_out, _), kv_cache = self.PaliGemma.llm(
             [prefix.tokens, None], mask=prefix_attn_mask, positions=prefix_positions
         )
-        action_conditioning = self._compute_action_conditioning(observation, prefix, prefix_out)
+        action_conditioning, gate_logits = self._compute_action_conditioning_with_logits(
+            observation, prefix, prefix_out
+        )
 
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
         suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
@@ -288,7 +307,30 @@ class Pi0(_model.BaseModel):
         assert prefix_out is None
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        aux = {}
+        if action_conditioning is not None and gate_logits is not None:
+            q_gates, o_gates = action_conditioning
+            q_raw, o_raw = gate_logits
+            q_gates = q_gates.astype(jnp.float32)
+            o_gates = o_gates.astype(jnp.float32)
+            q_raw = q_raw.astype(jnp.float32)
+            o_raw = o_raw.astype(jnp.float32)
+            gate_regularization_loss = _overview_action_conditioning.gate_l2_regularization(
+                q_raw,
+                o_raw,
+                self.overview_action_conditioning.config.gate_l2_regularization,
+            )
+            aux = {
+                "gate_regularization_loss": gate_regularization_loss,
+                "q_gate_abs_max": jnp.max(jnp.abs(q_gates)),
+                "q_gate_abs_gt_0_9": jnp.mean(jnp.abs(q_gates) > 0.9),
+                "q_raw_gate_abs_max": jnp.max(jnp.abs(q_raw)),
+                "o_gate_abs_max": jnp.max(jnp.abs(o_gates)),
+                "o_gate_abs_gt_0_9": jnp.mean(jnp.abs(o_gates) > 0.9),
+                "o_raw_gate_abs_max": jnp.max(jnp.abs(o_raw)),
+            }
+
+        return jnp.mean(jnp.square(v_t - u_t), axis=-1), aux
 
     @override
     def sample_actions(

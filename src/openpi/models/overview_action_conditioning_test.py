@@ -151,6 +151,7 @@ def test_zero_gate_projection_has_nonzero_gradient():
         num_layers=3,
         num_heads=2,
         dtype="float32",
+        gate_logit_scale=1.0,
         rngs=nnx.Rngs(0),
     )
     scene_context = jnp.arange(12, dtype=jnp.float32).reshape(2, 6)
@@ -167,12 +168,47 @@ def test_zero_gate_projection_has_nonzero_gradient():
     assert bool(jnp.any(grads.gate_proj.bias != 0))
 
 
+def test_gate_logit_scale_scales_controller_output():
+    controllers = [
+        oac.ActionConditioningController(
+            action_width=6,
+            num_layers=3,
+            num_heads=2,
+            dtype="float32",
+            gate_logit_scale=scale,
+            rngs=nnx.Rngs(0),
+        )
+        for scale in (1.0, 0.25)
+    ]
+    for controller in controllers:
+        controller.gate_proj.kernel.value = jnp.ones_like(controller.gate_proj.kernel.value)
+
+    scene_context = jnp.arange(12, dtype=jnp.float32).reshape(2, 6)
+    state_context = jnp.flip(scene_context, axis=-1)
+    full_scale = controllers[0].make_gate_logits(scene_context, state_context)
+    quarter_scale = controllers[1].make_gate_logits(scene_context, state_context)
+
+    np.testing.assert_allclose(quarter_scale[0], full_scale[0] * 0.25)
+    np.testing.assert_allclose(quarter_scale[1], full_scale[1] * 0.25)
+
+
+def test_gate_l2_regularization():
+    q_logits = jnp.array([1.0, 2.0])
+    o_logits = jnp.array([3.0, 4.0])
+
+    np.testing.assert_allclose(oac.gate_l2_regularization(q_logits, o_logits, 0.1), 0.75)
+
+
 def test_config_validation_and_pi0_default():
     config = pi0_config.Pi0Config()
     assert not config.overview_action_conditioning.enabled
 
     with pytest.raises(ValueError, match="rank"):
         oac.OverviewActionConditioningConfig(rank=0)
+    with pytest.raises(ValueError, match="gate_logit_scale"):
+        oac.OverviewActionConditioningConfig(gate_logit_scale=0)
+    with pytest.raises(ValueError, match="gate_l2_regularization"):
+        oac.OverviewActionConditioningConfig(gate_l2_regularization=-1)
     with pytest.raises(ValueError, match="lora_alpha"):
         oac.OverviewActionConditioningConfig(lora_alpha=0)
     with pytest.raises(ValueError, match="target"):

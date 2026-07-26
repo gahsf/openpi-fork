@@ -17,12 +17,18 @@ class OverviewActionConditioningConfig:
     target: Literal["q", "o", "q_o"] = "q_o"
     conditioning_mode: Literal["sample", "constant", "static"] = "sample"
     use_state_context: bool = True
+    gate_logit_scale: float = 1.0
+    gate_l2_regularization: float = 0.0
 
     def __post_init__(self):
         if self.rank <= 0:
             raise ValueError(f"rank must be positive, got {self.rank}")
         if self.lora_alpha <= 0:
             raise ValueError(f"lora_alpha must be positive, got {self.lora_alpha}")
+        if self.gate_logit_scale <= 0:
+            raise ValueError(f"gate_logit_scale must be positive, got {self.gate_logit_scale}")
+        if self.gate_l2_regularization < 0:
+            raise ValueError(f"gate_l2_regularization must be non-negative, got {self.gate_l2_regularization}")
         if self.target not in ("q", "o", "q_o"):
             raise ValueError(f"target must be one of q/o/q_o, got {self.target!r}")
         if self.conditioning_mode not in ("sample", "constant", "static"):
@@ -44,6 +50,10 @@ def _masked_mean(values: at.Array, mask: at.Array) -> at.Array:
     mask = mask.astype(values.dtype)
     denominator = jnp.maximum(jnp.sum(mask, axis=1, keepdims=True), 1)
     return jnp.sum(values * mask[..., None], axis=1) / denominator
+
+
+def gate_l2_regularization(q_logits: at.Array, o_logits: at.Array, coefficient: float) -> at.Array:
+    return coefficient * 0.5 * (jnp.mean(jnp.square(q_logits)) + jnp.mean(jnp.square(o_logits)))
 
 
 def make_constant_reference_inputs(
@@ -142,10 +152,12 @@ class ActionConditioningController(nnx.Module):
         num_layers: int,
         num_heads: int,
         dtype: str,
+        gate_logit_scale: float,
         rngs: nnx.Rngs,
     ):
         self.num_layers = num_layers
         self.num_heads = num_heads
+        self.gate_logit_scale = gate_logit_scale
         self.scene_norm = nnx.LayerNorm(action_width, dtype=dtype, rngs=rngs)
         self.state_norm = nnx.LayerNorm(action_width, dtype=dtype, rngs=rngs)
         self.hidden_proj = nnx.Linear(2 * action_width, action_width, dtype=dtype, rngs=rngs)
@@ -158,11 +170,16 @@ class ActionConditioningController(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, scene_context: at.Array, state_context: at.Array) -> tuple[at.Array, at.Array]:
+    def make_gate_logits(self, scene_context: at.Array, state_context: at.Array) -> tuple[at.Array, at.Array]:
         controller_input = jnp.concatenate([self.scene_norm(scene_context), self.state_norm(state_context)], axis=-1)
         hidden = nnx.swish(self.hidden_proj(controller_input))
         raw_gates = self.gate_proj(hidden).reshape(scene_context.shape[0], self.num_layers, 2, self.num_heads)
-        return jnp.tanh(raw_gates[:, :, 0]), jnp.tanh(raw_gates[:, :, 1])
+        raw_gates = raw_gates * self.gate_logit_scale
+        return raw_gates[:, :, 0], raw_gates[:, :, 1]
+
+    def __call__(self, scene_context: at.Array, state_context: at.Array) -> tuple[at.Array, at.Array]:
+        q_logits, o_logits = self.make_gate_logits(scene_context, state_context)
+        return jnp.tanh(q_logits), jnp.tanh(o_logits)
 
 
 class OverviewActionConditioning(nnx.Module):
@@ -200,6 +217,7 @@ class OverviewActionConditioning(nnx.Module):
             num_layers=num_layers,
             num_heads=num_heads,
             dtype=dtype,
+            gate_logit_scale=config.gate_logit_scale,
             rngs=rngs,
         )
 
@@ -219,6 +237,12 @@ class OverviewActionConditioning(nnx.Module):
 
     def make_gates(self, scene_context: at.Array, state_context: at.Array) -> tuple[at.Array, at.Array]:
         return self.controller(scene_context, state_context)
+
+    def make_gates_with_logits(
+        self, scene_context: at.Array, state_context: at.Array
+    ) -> tuple[tuple[at.Array, at.Array], tuple[at.Array, at.Array]]:
+        q_logits, o_logits = self.controller.make_gate_logits(scene_context, state_context)
+        return (jnp.tanh(q_logits), jnp.tanh(o_logits)), (q_logits, o_logits)
 
     def __call__(
         self,

@@ -68,8 +68,18 @@ def test_pi0_ocaev1_qo_model():
     batch_size = 1
     obs, act = config.fake_obs(batch_size), config.fake_act(batch_size)
 
-    loss = nnx_utils.module_jit(model.compute_loss)(key, obs, act)
+    loss, aux = nnx_utils.module_jit(model.compute_loss_with_aux)(key, obs, act)
     assert loss.shape == (batch_size, config.action_horizon)
+    assert set(aux) == {
+        "gate_regularization_loss",
+        "o_gate_abs_gt_0_9",
+        "o_gate_abs_max",
+        "o_raw_gate_abs_max",
+        "q_gate_abs_gt_0_9",
+        "q_gate_abs_max",
+        "q_raw_gate_abs_max",
+    }
+    assert all(bool(jnp.isfinite(value)) for value in aux.values())
 
     actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=2)
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
@@ -133,6 +143,9 @@ def test_pi0_ocaev1_libero_experiment_configs(name, target, conditioning_mode):
     assert config.model.overview_action_conditioning.target == target
     assert config.model.overview_action_conditioning.conditioning_mode == conditioning_mode
     assert config.model.overview_action_conditioning.rank == 16
+    expected_gate_l2 = 3e-2 if name in {"pi0_libero_e2_constant_qo", "pi0_libero_e7_ocae_qo"} else 0.0
+    assert config.model.overview_action_conditioning.gate_l2_regularization == expected_gate_l2
+
     assert config.freeze_filter == config.model.get_freeze_filter()
     assert isinstance(config.data, training_config.LeRobotLiberoDataConfig)
     assert config.data.repo_id == "physical-intelligence/libero"
@@ -158,6 +171,78 @@ def test_pi0_libero_e0_action_lora_config():
     assert config.batch_size == 32
     assert config.num_train_steps == 30_000
     assert config.ema_decay is None
+
+
+def test_pi0_libero_e7_gate025_config():
+    config = training_config.get_config("pi0_libero_e7_ocae_qo_gate025")
+
+    assert isinstance(config.model, pi0_config.Pi0Config)
+    assert config.model.overview_action_conditioning.gate_logit_scale == 0.25
+    assert config.model.overview_action_conditioning.conditioning_mode == "sample"
+    assert config.freeze_filter == config.model.get_freeze_filter()
+    assert config.batch_size == 32
+    assert config.num_train_steps == 30_000
+
+
+def test_pi0_libero_e2_gate025_config():
+    config = training_config.get_config("pi0_libero_e2_constant_qo_gate025")
+
+    assert isinstance(config.model, pi0_config.Pi0Config)
+    assert config.model.overview_action_conditioning.gate_logit_scale == 0.25
+    assert config.model.overview_action_conditioning.conditioning_mode == "constant"
+    assert config.freeze_filter == config.model.get_freeze_filter()
+    assert config.batch_size == 32
+    assert config.num_train_steps == 30_000
+
+
+def test_pi0_libero_e7_gate_l2_config():
+    config = training_config.get_config("pi0_libero_e7_ocae_qo_gate_l2_1e3")
+
+    assert isinstance(config.model, pi0_config.Pi0Config)
+    assert config.model.overview_action_conditioning.gate_logit_scale == 1.0
+    assert config.model.overview_action_conditioning.gate_l2_regularization == 1e-3
+    assert config.model.overview_action_conditioning.conditioning_mode == "sample"
+    assert config.freeze_filter == config.model.get_freeze_filter()
+    assert config.batch_size == 32
+    assert config.num_train_steps == 30_000
+
+
+def test_pi0_libero_e7_gate_l2_1e2_config():
+    config = training_config.get_config("pi0_libero_e7_ocae_qo_gate_l2_1e2")
+
+    assert isinstance(config.model, pi0_config.Pi0Config)
+    assert config.model.overview_action_conditioning.gate_logit_scale == 1.0
+    assert config.model.overview_action_conditioning.gate_l2_regularization == 1e-2
+    assert config.model.overview_action_conditioning.conditioning_mode == "sample"
+    assert config.freeze_filter == config.model.get_freeze_filter()
+    assert config.batch_size == 32
+    assert config.num_train_steps == 30_000
+
+
+def test_pi0_libero_e7_gate_l2_3e2_pilot_config():
+    config = training_config.get_config("pi0_libero_e7_ocae_qo_gate_l2_3e2")
+
+    assert isinstance(config.model, pi0_config.Pi0Config)
+    assert config.model.overview_action_conditioning.gate_logit_scale == 1.0
+    assert config.model.overview_action_conditioning.gate_l2_regularization == 3e-2
+    assert config.model.overview_action_conditioning.conditioning_mode == "sample"
+    assert config.freeze_filter == config.model.get_freeze_filter()
+    assert config.batch_size == 32
+    assert config.num_train_steps == 1_000
+    assert config.save_interval == 1_000
+
+
+def test_pi0_libero_e2_gate_l2_3e2_pilot_config():
+    config = training_config.get_config("pi0_libero_e2_constant_qo_gate_l2_3e2")
+
+    assert isinstance(config.model, pi0_config.Pi0Config)
+    assert config.model.overview_action_conditioning.gate_logit_scale == 1.0
+    assert config.model.overview_action_conditioning.gate_l2_regularization == 3e-2
+    assert config.model.overview_action_conditioning.conditioning_mode == "constant"
+    assert config.freeze_filter == config.model.get_freeze_filter()
+    assert config.batch_size == 32
+    assert config.num_train_steps == 1_000
+    assert config.save_interval == 1_000
 
 
 def test_pi0_ocaev1_train_sample_and_checkpoint_roundtrip(tmp_path):
