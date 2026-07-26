@@ -788,6 +788,28 @@ _CONFIGS = [
     _pi0_ocaev1_libero_config("pi0_libero_e5_ocae_q", target="q"),
     _pi0_ocaev1_libero_config("pi0_libero_e6_ocae_o", target="o"),
     _pi0_ocaev1_libero_config("pi0_libero_e7_ocae_qo", target="q_o", gate_l2_regularization=3e-2),
+    TrainConfig(
+        name="pi0_libero_e7_ocae_qo_full_ft",
+        model=pi0_config.Pi0Config(
+            overview_action_conditioning=overview_action_conditioning.OverviewActionConditioningConfig(
+                enabled=True,
+                rank=16,
+                lora_alpha=16.0,
+                target="q_o",
+                conditioning_mode="sample",
+                gate_l2_regularization=3e-2,
+            )
+        ),
+        data=_pi0_libero_experiment_data(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        # Explicitly leave every parameter trainable for the full fine-tuning positive control.
+        freeze_filter=nnx.Nothing,
+        lr_schedule=_pi0_libero_experiment_schedule(),
+        ema_decay=None,
+        batch_size=3,
+        num_train_steps=30_000,
+        fsdp_devices=3,
+    ),
     _pi0_ocaev1_libero_config("pi0_libero_e7_ocae_qo_gate025", target="q_o", gate_logit_scale=0.25),
     _pi0_ocaev1_libero_config("pi0_libero_e7_ocae_qo_gate_l2_1e3", target="q_o", gate_l2_regularization=1e-3),
     _pi0_ocaev1_libero_config("pi0_libero_e7_ocae_qo_gate_l2_1e2", target="q_o", gate_l2_regularization=1e-2),

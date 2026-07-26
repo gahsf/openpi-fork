@@ -195,6 +195,20 @@ def test_pi0_libero_e2_gate025_config():
     assert config.num_train_steps == 30_000
 
 
+def test_pi0_libero_e7_full_ft_config():
+    config = training_config.get_config("pi0_libero_e7_ocae_qo_full_ft")
+
+    assert isinstance(config.model, pi0_config.Pi0Config)
+    assert config.model.overview_action_conditioning.enabled
+    assert config.model.overview_action_conditioning.target == "q_o"
+    assert config.model.overview_action_conditioning.conditioning_mode == "sample"
+    assert config.model.overview_action_conditioning.gate_l2_regularization == 3e-2
+    assert config.freeze_filter == nnx.Nothing
+    assert config.batch_size == 3
+    assert config.fsdp_devices == 3
+    assert config.num_train_steps == 30_000
+
+
 def test_pi0_libero_e7_gate_l2_config():
     config = training_config.get_config("pi0_libero_e7_ocae_qo_gate_l2_1e3")
 
