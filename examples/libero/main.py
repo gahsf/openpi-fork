@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import collections
 import dataclasses
 import json
@@ -43,6 +45,7 @@ class Args:
     #################################################################################################################
     video_out_path: str = "data/libero/videos"  # Path to save videos
     results_out_path: str = "data/libero/results.jsonl"  # Path to save structured rollout results
+    action_trace_out_path: str | None = None  # Optional per-step state and action JSONL path
     save_videos: bool = True
 
     seed: int = 7  # Random Seed (for reproducibility)
@@ -60,9 +63,19 @@ def eval_libero(args: Args) -> None:
 
     video_out_path = pathlib.Path(args.video_out_path)
     results_out_path = pathlib.Path(args.results_out_path)
+    action_trace_out_path = pathlib.Path(args.action_trace_out_path) if args.action_trace_out_path else None
     if results_out_path.exists():
         raise FileExistsError(f"Results file already exists: {results_out_path}. Choose a new --args.results-out-path.")
+    if action_trace_out_path is not None and action_trace_out_path.exists():
+        raise FileExistsError(
+            f"Action trace file already exists: {action_trace_out_path}. Choose a new --args.action-trace-out-path."
+        )
     results_out_path.parent.mkdir(parents=True, exist_ok=True)
+    if action_trace_out_path is not None:
+        action_trace_out_path.parent.mkdir(parents=True, exist_ok=True)
+    action_trace_file = (
+        action_trace_out_path.open("a", encoding="utf-8", buffering=1) if action_trace_out_path else None
+    )
     if args.save_videos:
         video_out_path.mkdir(parents=True, exist_ok=True)
 
@@ -135,19 +148,18 @@ def eval_libero(args: Args) -> None:
                     # Save preprocessed image for replay video
                     replay_images.append(img)
 
+                    state = np.concatenate(
+                        (obs["robot0_eef_pos"], _quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
+                    )
+                    replanned = False
+                    planned_actions = None
                     if not action_plan:
                         # Finished executing previous action chunk -- compute new chunk
                         # Prepare observations dict
                         element = {
                             "observation/image": img,
                             "observation/wrist_image": wrist_img,
-                            "observation/state": np.concatenate(
-                                (
-                                    obs["robot0_eef_pos"],
-                                    _quat2axisangle(obs["robot0_eef_quat"]),
-                                    obs["robot0_gripper_qpos"],
-                                )
-                            ),
+                            "observation/state": state,
                             "prompt": str(task_description),
                         }
 
@@ -156,9 +168,26 @@ def eval_libero(args: Args) -> None:
                         assert len(action_chunk) >= args.replan_steps, (
                             f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
                         )
-                        action_plan.extend(action_chunk[: args.replan_steps])
+                        planned_actions = np.asarray(action_chunk[: args.replan_steps])
+                        action_plan.extend(planned_actions)
+                        replanned = True
 
                     action = action_plan.popleft()
+                    if action_trace_file is not None:
+                        action_trace_record = {
+                            "record_type": "action",
+                            "task_suite": args.task_suite_name,
+                            "task_id": task_id,
+                            "task_description": task_description,
+                            "episode_idx": episode_idx,
+                            "seed": args.seed,
+                            "t": t,
+                            "state": np.asarray(state).tolist(),
+                            "action": np.asarray(action).tolist(),
+                            "replanned": replanned,
+                            "planned_actions": planned_actions.tolist() if planned_actions is not None else None,
+                        }
+                        action_trace_file.write(json.dumps(action_trace_record) + "\n")
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
@@ -198,6 +227,22 @@ def eval_libero(args: Args) -> None:
             }
             with results_out_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(episode_result) + "\n")
+            if action_trace_file is not None:
+                action_trace_file.write(
+                    json.dumps(
+                        {
+                            "record_type": "episode_end",
+                            "task_suite": args.task_suite_name,
+                            "task_id": task_id,
+                            "episode_idx": episode_idx,
+                            "seed": args.seed,
+                            "success": bool(done),
+                            "steps": t,
+                            "error": episode_error,
+                        }
+                    )
+                    + "\n"
+                )
 
             # Log current results
             logging.info(f"Success: {done}")
@@ -221,6 +266,8 @@ def eval_libero(args: Args) -> None:
     }
     with results_out_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(summary_result) + "\n")
+    if action_trace_file is not None:
+        action_trace_file.close()
 
 
 def _get_libero_env(task, resolution, seed):
